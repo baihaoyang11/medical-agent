@@ -1,0 +1,26 @@
+services:
+  medical-agent:
+    build: .
+    image: medical-agent:2.2
+    container_name: medical-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8103:8103"
+    volumes:
+      # 向量库与预处理产物挂出来，重建容器不丢数据
+      - ./data:/app/data
+      - ./pdf_output:/app/pdf_output:ro
+    environment:
+      MILVUS_QA_URI: /app/data/milvus_agent.db
+      MILVUS_PDF_URI: /app/data/pdf_agent.db
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 2G

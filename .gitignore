@@ -4,21 +4,32 @@
 # Python编译缓存
 __pycache__/
 *.pyc
+*.pyo
 # 大型医学PDF教材
 *.pdf
 # 密钥、配置
 .env
+.env.local
 settings.json
 *.key
 # 缓存、日志
 cache/
 logs/
+*.log
 venv/
 .venv/
 # 数据集、病历隐私文件
+# 注意：整个 data/ 忽略会把 data/README.md 也排掉，所以用「忽略内容 + 保留说明」
+data/*
+!data/README.md
 dataset/
 patient_data/
-data/
-# 测试报告
+# 测试与构建产物
 test_report.json
 *.report.json
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/

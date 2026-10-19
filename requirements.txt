@@ -1,0 +1,34 @@
+# Web 服务
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.5
+
+# Agent 编排
+langgraph>=0.2
+langchain-core>=0.3
+langchain-openai>=0.2
+langchain-milvus>=0.1
+langchain-community>=0.3
+langchain-text-splitters>=0.3
+
+# 检索
+pymilvus>=2.4
+rank-bm25>=0.2.2
+jieba>=0.42
+numpy>=1.26
+
+# 模型侧
+zhipuai>=2.1
+openai>=1.30
+
+# 数据处理
+pandas>=2.2
+openpyxl>=3.1
+pdfplumber>=0.11
+tqdm>=4.66
+
+# 测试
+pytest>=8.0
+
+# 可选：本地重排模型（不装则自动降级为 keyword 重排）
+# sentence-transformers>=3.0
