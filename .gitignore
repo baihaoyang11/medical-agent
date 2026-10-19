@@ -52,3 +52,6 @@ eval/route_audit-hashing.md
 eval/route_audit-hashing.json
 eval/dual_report-hashing.md
 eval/dual_results-hashing.json
+
+# 编辑器配置（含本机解释器绝对路径，不进仓库）
+.vscode/
