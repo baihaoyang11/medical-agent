@@ -23,31 +23,77 @@ from langchain_core.stores import InMemoryStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.retrievers import ParentDocumentRetriever
 
+from config import config
+from core.errors import UpstreamError
+from core.retry import call_with_retry
+
 zhipu_api_key = os.getenv('ZHIPU_API_KEY')
 if not zhipu_api_key:
     raise ValueError("请设置环境变量 ZHIPU_API_KEY")
 client = ZhipuAI(api_key=zhipu_api_key)
 
 class ZhipuAIEmbeddings(Embeddings):
-    def __init__(self,client):
-        self.client = client
+    """智谱 Embedding-3 封装。
 
-    def embed_documents(self,texts):
-        embeddings =[]
-        for text in texts:
-            response = self.client.embeddings.create(
-                model='embedding-3',
-                input=text
-            )
-            embeddings.append(response.data[0].embedding)
+    旧实现逐条调用 API：一万篇文档就是一万次 HTTPS 往返，按 200ms/次
+    算要 33 分钟，且中途任何一次 429/5xx 都会让整批入库前功尽弃。
+
+    这里改成：
+    - 批量提交（一次 32 条），往返次数降到 1/32
+    - 失败按指数退避重试，重试仍失败就抛出，由调用方决定是否落盘检查点
+    - 按 response.data[i].index 回填顺序 —— 批量接口不保证返回顺序与入参一致，
+      错位会让"向量 A 对应文档 B"，是最难排查的数据污染
+    """
+
+    def __init__(self, client, batch_size: int | None = None):
+        self.client = client
+        self.batch_size = batch_size or getattr(config, "EMBED_BATCH_SIZE", 32)
+
+    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        def _call() -> list[list[float]]:
+            try:
+                response = self.client.embeddings.create(
+                    model=config.EMBEDDING_MODEL,
+                    input=texts,
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise UpstreamError(f"embedding 批量调用失败: {exc}") from exc
+
+            # 按 index 回填，不假设顺序
+            ordered: list[tuple[int, list[float]]] = []
+            for item in response.data:
+                idx = getattr(item, "index", None)
+                ordered.append((idx if idx is not None else len(ordered), item.embedding))
+            ordered.sort(key=lambda pair: pair[0])
+            return [vec for _, vec in ordered]
+
+        return call_with_retry(
+            _call,
+            retries=config.UPSTREAM_RETRIES,
+            base_delay=config.RETRY_BASE_DELAY,
+            op_name="embed_batch",
+        )
+
+    def embed_documents(self, texts):
+        texts = list(texts)
+        embeddings: list[list[float]] = []
+        for start in range(0, len(texts), self.batch_size):
+            chunk = texts[start:start + self.batch_size]
+            embeddings.extend(self._embed_batch(chunk))
+            if len(texts) > self.batch_size:
+                print(f"  已向量化 {start + len(chunk)}/{len(texts)} 条")
         return embeddings
-    
-    def embed_query(self,text):
-        return self.embed_documents([text])[0]
-    
+
+    def embed_query(self, text):
+        return self._embed_batch([text])[0]
+
+    def embed_documents_single_batch(self, texts):
+        """debug 用：确认批量接口在给定 batch_size 下不超限。"""
+        return self._embed_batch(list(texts))
+
 class Milvus_vector():
-    def __init__(self, client, uri="/home/user/milvus_agent.db"):
-        self.URI = uri
+    def __init__(self, client, uri=None):
+        self.URI = uri or config.MILVUS_QA_URI
         # 这里的 client 是你传入的 ZhipuAiClient 实例
         self.embeddings = ZhipuAIEmbeddings(client=client) 
         
@@ -108,8 +154,8 @@ class Milvus_vector():
         print("\n✅ 已创建 Milvus 索引完成 ‼")
         return self.vectorstore
 class Pdf_retriever():
-    def __init__(self, client, uri="./pdf_agent.db"):
-        self.URI = uri
+    def __init__(self, client, uri=None):
+        self.URI = uri or config.MILVUS_PDF_URI
         self.embeddings = ZhipuAIEmbeddings(client=client)
         # 定义索引类型 [cite: 2570-2577]
         self.dense_index = {"metric_type": "IP", "index_type": "IVF_FLAT"}
@@ -142,7 +188,7 @@ class Pdf_retriever():
             parent_splitter=self.parent_splitter,
         )
         
-        # 批量入库 [cite: 2621-2629]
+        # 批量入库
         count = 0
         temp = []
         for doc in tqdm(docs):
@@ -151,7 +197,15 @@ class Pdf_retriever():
                 self.retriever.add_documents(temp)
                 count += len(temp)
                 temp = []
-                time.sleep(1) 
+                time.sleep(1)
+        # 旧版漏了这一步：不足 10 条的尾巴永远不会入库，
+        # 而 PDF 页数通常不是 10 的整数倍，等于每本书丢几页
+        if temp:
+            self.retriever.add_documents(temp)
+            count += len(temp)
+            temp = []
+
+        print(f"✅ PDF 入库完成：{count} 页")
         return self.retriever
 
 def prepare_pdf_document(file_path="./pdf_output/pdf_detailed_text.xlsx"):
