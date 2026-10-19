@@ -1,4 +1,11 @@
-# 只装测试需要的东西。单测用 Fake 替掉外部依赖，所以不需要 pymilvus / jieba /
-# zhipuai 这些重型包 —— 这让 CI 从几分钟降到几十秒。
+# 只装测试需要的东西。单测用 Fake 替掉外部依赖，所以不需要 pymilvus / zhipuai
+# 这类重型包 —— 这让 CI 从几分钟降到几十秒。
 pytest>=8.0
 langgraph>=0.2
+
+# 评测测试（tests/test_eval.py）需要：
+#   numpy  —— eval/retrievers.py 顶层就用它做向量运算
+#   jieba  —— 与生产 skills/hybrid_search.py 的分词保持一致。
+#             不装也能跑（回退到字符二元组），但那样测的是另一条路径
+numpy>=1.24
+jieba>=0.42
