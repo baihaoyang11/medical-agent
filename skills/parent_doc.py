@@ -1,12 +1,17 @@
 """
 PDF教材检索 Skill — 混合检索 + 父子文档重建
 """
+import threading
+
 import jieba
 import numpy as np
 from typing import Any, Dict, List, Optional
 from pymilvus import MilvusClient
 from rank_bm25 import BM25Okapi
 from core.base_skill import BaseSkill, SkillResult
+from core.errors import UpstreamError
+from core.observability import span
+from core.retry import call_with_retry
 from core.rrf import rrf_merge
 
 jieba.setLogLevel(20)
@@ -39,6 +44,19 @@ class ParentDocSearchSkill(BaseSkill):
         self._bm25: Optional[BM25Okapi] = None
         self._bm25_docs: List[Dict] = []
         self._doc_id_map: Dict[str, List[Dict]] = {}
+        # 同 HybridSearch：懒加载索引，用锁保护，避免并发重复构建
+        self._bm25_lock = threading.Lock()
+
+    def _embed(self, query: str) -> List[float]:
+        """Embedding 调用：异常包装成可重试的 UpstreamError。"""
+
+        def _call() -> List[float]:
+            try:
+                return self._embeddings.embed_query(query)
+            except Exception as exc:  # noqa: BLE001
+                raise UpstreamError(f"embedding 调用失败: {exc}") from exc
+
+        return call_with_retry(_call, op_name="embed_query")
 
     # ────────── 数据加载 ──────────
 
@@ -67,23 +85,30 @@ class ParentDocSearchSkill(BaseSkill):
     def _ensure_bm25(self):
         if self._bm25 is not None:
             return
-        print("  [ParentDoc] 构建 BM25 索引...")
-        docs = self._load_texts()
-        if not docs:
-            self._bm25 = BM25Okapi([])
-            return
-        corpus = [list(jieba.cut(d["text"])) for d in docs]
-        self._bm25 = BM25Okapi(corpus)
-        self._bm25_docs = docs
-        # 构建 doc_id → 子文档列表的映射，用于重建父文档
-        for d in docs:
-            self._doc_id_map.setdefault(d["doc_id"], []).append(d)
-        print(f"  [ParentDoc] BM25 索引完成: {len(docs)} 个子文档, {len(self._doc_id_map)} 个父文档")
+        with self._bm25_lock:
+            if self._bm25 is not None:
+                return
+            print("  [ParentDoc] 构建 BM25 索引...")
+            with span("bm25_build", collection=self._collection):
+                docs = self._load_texts()
+                if not docs:
+                    self._bm25 = BM25Okapi([])
+                    return
+                corpus = [list(jieba.cut(d["text"])) for d in docs]
+                self._bm25 = BM25Okapi(corpus)
+                self._bm25_docs = docs
+                # 构建 doc_id → 子文档列表的映射，用于重建父文档
+                for d in docs:
+                    self._doc_id_map.setdefault(d["doc_id"], []).append(d)
+            print(
+                f"  [ParentDoc] BM25 索引完成: {len(docs)} 个子文档, "
+                f"{len(self._doc_id_map)} 个父文档"
+            )
 
     # ────────── 检索 ──────────
 
     def _dense_search(self, query: str, k: int) -> List[Dict]:
-        vec = self._embeddings.embed_query(query)
+        vec = self._embed(query)
         results = self._client.search(
             self._collection, [vec], anns_field="dense",
             limit=k * 3, output_fields=["pk", "text", "doc_id", "source"])
@@ -189,5 +214,4 @@ class ParentDocSearchSkill(BaseSkill):
                 count=len(parent_docs), method=method, query=query,
                 dense_count=len(dense), bm25_count=len(bm25))
         except Exception as e:
-            print(f"  [ParentDoc] 错误: {e}")
-            return SkillResult.fail(f"PDF教材检索失败: {e}", query=query)
+            return SkillResult.fail(f"PDF教材检索失败: {e}", query=query, error_type=type(e).__name__)

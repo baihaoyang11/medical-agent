@@ -1,12 +1,17 @@
 """
 混合检索 Skill — 稠密向量语义检索 + BM25关键词检索 + RRF融合排序
 """
+import threading
+
 import jieba
 import numpy as np
 from typing import Any, Dict, List, Optional
 from pymilvus import MilvusClient
 from rank_bm25 import BM25Okapi
 from core.base_skill import BaseSkill, SkillResult
+from core.errors import UpstreamError
+from core.observability import span
+from core.retry import call_with_retry
 from core.rrf import rrf_merge
 
 jieba.setLogLevel(20)
@@ -37,6 +42,22 @@ class HybridSearchSkill(BaseSkill):
         }
         self._bm25: Optional[BM25Okapi] = None
         self._bm25_docs: List[Dict] = []
+        # BM25 索引是懒加载的：并发首请求会重复构建（几万篇文档要好几秒），
+        # 用锁做双检，保证只建一次。
+        self._bm25_lock = threading.Lock()
+
+    # ────────── 外部调用封装 ──────────
+
+    def _embed(self, query: str) -> List[float]:
+        """Embedding 调用：任何异常都包装成可重试的 UpstreamError。"""
+
+        def _call() -> List[float]:
+            try:
+                return self._embeddings.embed_query(query)
+            except Exception as exc:  # noqa: BLE001
+                raise UpstreamError(f"embedding 调用失败: {exc}") from exc
+
+        return call_with_retry(_call, op_name="embed_query")
 
     # ────────── BM25 索引 ──────────
 
@@ -63,20 +84,24 @@ class HybridSearchSkill(BaseSkill):
     def _ensure_bm25(self):
         if self._bm25 is not None:
             return
-        print("  [HybridSearch] 构建 BM25 索引...")
-        docs = self._load_texts()
-        if not docs:
-            self._bm25 = BM25Okapi([])
-            return
-        corpus = [list(jieba.cut(d["text"])) for d in docs]
-        self._bm25 = BM25Okapi(corpus)
-        self._bm25_docs = docs
-        print(f"  [HybridSearch] BM25 索引完成: {len(docs)} 篇")
+        with self._bm25_lock:
+            if self._bm25 is not None:
+                return
+            print("  [HybridSearch] 构建 BM25 索引...")
+            with span("bm25_build", collection=self._collection):
+                docs = self._load_texts()
+                if not docs:
+                    self._bm25 = BM25Okapi([])
+                    return
+                corpus = [list(jieba.cut(d["text"])) for d in docs]
+                self._bm25 = BM25Okapi(corpus)
+                self._bm25_docs = docs
+            print(f"  [HybridSearch] BM25 索引完成: {len(docs)} 篇")
 
     # ────────── 稠密检索 ──────────
 
     def _dense_search(self, query: str, k: int) -> List[Dict]:
-        vec = self._embeddings.embed_query(query)
+        vec = self._embed(query)
         results = self._client.search(
             self._collection, [vec], anns_field="dense",
             limit=k * 2, output_fields=["pk", "text", "doc_id"])
@@ -134,5 +159,5 @@ class HybridSearchSkill(BaseSkill):
                 count=len(final), method=method, query=query,
                 dense_count=len(dense), bm25_count=len(bm25))
         except Exception as e:
-            print(f"  [HybridSearch] 错误: {e}")
-            return SkillResult.fail(f"混合检索失败: {e}", query=query)
+            # 关键：把异常向上抛，让 Agent 层决定降级；不要再 print 吞掉
+            return SkillResult.fail(f"混合检索失败: {e}", query=query, error_type=type(e).__name__)
