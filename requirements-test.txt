@@ -1,0 +1,4 @@
+# 只装测试需要的东西。单测用 Fake 替掉外部依赖，所以不需要 pymilvus / jieba /
+# zhipuai 这些重型包 —— 这让 CI 从几分钟降到几十秒。
+pytest>=8.0
+langgraph>=0.2

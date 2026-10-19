@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: 单测（无需 API Key）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # 单测用 Fake 替掉 Milvus / embedding / LLM，所以只装轻量依赖。
+      # 这是刻意的：如果测试依赖重型包，CI 会慢到没人愿意等，最后就没人跑。
+      - name: 安装测试依赖
+        run: pip install -r requirements-test.txt
+
+      - name: 语法编译检查
+        run: python -m compileall -q core agents skills config.py agent.py model1.py vectors1.py
+
+      - name: 运行单测
+        run: python -m pytest tests/ -q --tb=short
+
+  config-guard:
+    name: 配置自检可用性
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # 这里不校验 Key（CI 里没有），只验证 validate() 本身能跑、
+      # 且在缺 Key 的情况下确实能报出问题 —— 防止有人把自检逻辑改坏了。
+      - name: 缺 Key 时必须报错
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from config import config
+          problems = config.validate()
+          assert problems, "缺 Key 时 validate() 必须返回问题，否则 fail-fast 失效"
+          print("捕获到配置问题：")
+          for p in problems:
+              print("  -", p)
+          PY
+
+  full-install:
+    name: 运行依赖可安装（依赖漂移预警）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      # 单独一个 job：失败时能一眼看出是"依赖装不上"而不是"代码坏了"
+      - name: 安装完整依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: 验证关键模块可导入
+        run: |
+          python -c "import fastapi, pymilvus, jieba, rank_bm25, numpy, zhipuai; print('运行时依赖导入正常')"
