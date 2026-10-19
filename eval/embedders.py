@@ -64,7 +64,8 @@ class BgeEmbedder:
 
     为什么不用 sentence-transformers 的 SentenceTransformer 一行搞定：
     它在 6.1 + transformers 5.20 这套新版本上，读不到老模型仓库里的
-    `config_sentence_transformers.json` 就直接抛 FileNotFoundError——
+    config_sentence_transformers.json（模型目录下的配置文件，不是本仓库的文件）
+    就直接抛 FileNotFoundError——
     而这个文件在 hub 上是存在的，是客户端只下了一部分。换版本、改缓存都是绕远路。
 
     BGE 的池化方式是取 **[CLS]** 而不是 mean pooling，实现就三行，
