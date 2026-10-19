@@ -1,5 +1,9 @@
 # 医学 RAG 问答系统（生产化改造版）
 
+[![CI](https://github.com/baihaoyang11/medical-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/baihaoyang11/medical-agent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+
 基于 **LangGraph + 双路混合检索 + 父子文档** 的医学问答服务。原始版本是毕业设计，
 现在这份仓库是在原版基础上按生产标准补完的工程版本：真实分流的路由、
 可回退的检索闭环、可追溯的引用、统一异常与可观测性、容器化与测试覆盖。
