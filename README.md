@@ -76,12 +76,33 @@ medical-agent/
 ## 3. 快速开始
 
 ```bash
-cp .env.example .env          # 填 ZHIPU_API_KEY / DEEPSEEK_API_KEY
+# 0. 先自检：不需要任何 API Key，验证代码与测试是好的
+python tasks.py verify        # 配置自检 + 语法检查 + 51 个单测
+
+# 1. 装依赖、配 Key
 pip install -r requirements.txt
-python vectors1.py            # 构建向量库（首次）
-python agent.py               # http://localhost:8103/docs
-pytest tests/ -q              # 51 passed
+cp .env.example .env          # 填 ZHIPU_API_KEY / DEEPSEEK_API_KEY
+
+# 2. 准备数据（没有真实语料时先生成演示数据）
+python tasks.py demo-data     # → data/demo.jsonl，12 条
+python tasks.py data          # 检查数据是否就绪，会告诉你还缺什么
+
+# 3. 建库、起服务
+python vectors1.py            # 首次需要，构建向量库
+python tasks.py dev           # http://localhost:8103/docs
 ```
+
+没有 make 的机器直接用 `python tasks.py <目标>`；有 make 的环境
+`make verify` 等价（Makefile 只是转发，两边行为一致）。
+
+入口一览：
+
+| 命令 | 作用 | 需要 Key |
+|---|---|---|
+| `python tasks.py verify` | 配置自检 + 语法检查 + 单测 | 否 |
+| `python tasks.py data` | 检查数据就绪情况 | 否 |
+| `python tasks.py demo-data` | 生成演示语料 | 否 |
+| `python tasks.py dev` | 启动服务 | 是 |
 
 容器方式：
 
