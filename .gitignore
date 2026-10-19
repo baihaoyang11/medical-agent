@@ -40,6 +40,7 @@ dist/
 # 聚合结论已写进 eval/report.md，原始数据本地重跑即可
 eval/results.json
 eval/route_audit.json
+eval/dual_results.json
 
 # hashing 快速校验的产物（CI 用）。
 # 它只验证"管线能跑通"，不是效果结论 —— 不提交，也不允许覆盖 bge 的报告。
@@ -49,3 +50,5 @@ eval/report-hashing.md
 eval/results-hashing.json
 eval/route_audit-hashing.md
 eval/route_audit-hashing.json
+eval/dual_report-hashing.md
+eval/dual_results-hashing.json

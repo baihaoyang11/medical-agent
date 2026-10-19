@@ -115,6 +115,30 @@ jobs:
                 f"{d['fallback_rate']:.1%}，真实路由 R@5 {d['r5_actual_routing']:.3f}")
           PY
 
+      # 双库评测只依赖 numpy，和上面共用一次安装。
+      # --fast 跳过预算曲线和分类型，CI 里只需要证明链路和断言成立。
+      - name: 双库评测（qa_k / pdf_k 链路）
+        run: python -m eval.run_dual_eval --embedder hashing --fast
+
+      # 这条断言守的是一个**设计前提**：QA 库只放结论句，所以单靠 QA 路
+      # 不可能覆盖全部要点。如果哪天有人把 QA 库改回完整正文，
+      # 整个双库评测就失去区分度（第一版就是这么废掉的），这里会立刻红。
+      - name: 断言双库评测有效
+        run: |
+          python - <<'PY'
+          import json
+          d = json.load(open("eval/dual_results-hashing.json", encoding="utf-8"))
+          g = d["grid"]
+          assert len(g) >= 20, f"网格不完整: {len(g)} 格"
+          qa_only = max(r["point_recall"] for r in g if r["pdf_k"] == 0)
+          with_pdf = max(r["point_recall"] for r in g if r["pdf_k"] > 0)
+          assert qa_only < with_pdf, (
+              f"QA 单路不应达到 PDF 的水平（{qa_only:.3f} vs {with_pdf:.3f}）——"
+              "说明 QA 库里不只有结论句，双库评测失去区分度"
+          )
+          print(f"双库评测有效：QA 单路上限 {qa_only:.3f}，含 PDF 上限 {with_pdf:.3f}")
+          PY
+
       - name: 上传评测报告
         uses: actions/upload-artifact@v4
         with:
@@ -124,6 +148,8 @@ jobs:
             eval/results-hashing.json
             eval/route_audit-hashing.md
             eval/route_audit-hashing.json
+            eval/dual_report-hashing.md
+            eval/dual_results-hashing.json
 
   full-install:
     name: 运行依赖可安装（依赖漂移预警）

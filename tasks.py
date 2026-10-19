@@ -175,6 +175,18 @@ def audit() -> None:
     run([PY, "-m", "eval.route_audit"])
 
 
+def eval_dual() -> None:
+    """双库评测：qa_k / pdf_k / 上下文预算的依据"""
+    step("双库评测：bge-small-zh")
+    run([PY, "-m", "eval.run_dual_eval", "--embedder", "bge"])
+
+
+def eval_dual_fast() -> None:
+    """双库评测（零依赖确定性向量，CI 用）"""
+    step("双库评测：hashing（零依赖）")
+    run([PY, "-m", "eval.run_dual_eval", "--embedder", "hashing", "--fast"])
+
+
 TARGETS = {
     "setup": setup,
     "setup-test": setup_test,
@@ -190,6 +202,8 @@ TARGETS = {
     "eval": eval_bge,
     "eval-fast": eval_fast,
     "audit": audit,
+    "dual": eval_dual,
+    "dual-fast": eval_dual_fast,
 }
 
 
@@ -210,6 +224,7 @@ def main() -> None:
         print("  verify       配置自检 + 语法检查 + 单测（无需 Key）")
         print("  eval         检索评测：跑对比实验并生成 eval/report.md")
         print("  audit        路由审计：关键词路由器的兜底率与端到端影响")
+        print("  dual         双库评测：qa_k / pdf_k / 上下文预算的依据")
         return
 
     target = sys.argv[1]
