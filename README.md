@@ -1,287 +1,267 @@
-# 🎓 医学RAG问答系统 - 毕业设计项目
+# 医学 RAG 问答系统（生产化改造版）
 
-基于 **检索增强生成 (RAG)** 技术的智能医学问答系统，采用 **双路混合检索 + 父子文档策略** 实现高质量的医学知识问答。
+基于 **LangGraph + 双路混合检索 + 父子文档** 的医学问答服务。原始版本是毕业设计，
+现在这份仓库是在原版基础上按生产标准补完的工程版本：真实分流的路由、
+可回退的检索闭环、可追溯的引用、统一异常与可观测性、容器化与测试覆盖。
 
----
-
-## 📁 项目结构
-
-```
-医学RAG/
-├── agent.py              # ⭐ FastAPI服务主文件（核心业务逻辑）
-├── model1.py             # 模型层（智谱Embedding + DeepSeek LLM）
-├── vectors1.py           # 向量数据库层（Milvus双路召回系统）
-├── preprocess.py         # PDF文档预处理
-├── test.py               # ⭐ 综合测试脚本
-├── data/                 # 训练数据目录
-│   ├── data.jsonl        # QA问答对数据
-│   ├── dialog.jsonl      # 对话数据
-│   └── train.jsonl       # 训练集
-├── pdf_documents/        # 原始PDF医学教材
-├── pdf_output/           # PDF处理后的结构化数据
-│   ├── pdf_detailed_text.xlsx
-│   └── pdf_extraction_summary.xlsx
-├── milvus_agent.db       # QA问答对向量数据库（Milvus）
-└── pdf_agent.db          # PDF文档向量数据库（Milvus）
-```
+> 一句话概括改动：**原来只有"能跑通"，现在能回答"出了问题在哪、错在哪、怎么退"。**
 
 ---
 
-## 🏗️ 技术架构
-
-### 核心技术栈
-
-| 模块 | 技术 | 说明 |
-|------|------|------|
-| **嵌入模型** | 智谱AI Embedding-3 | 文本向量化（1024维） |
-| **语言模型** | DeepSeek-Chat | 答案生成大模型 |
-| **向量数据库** | Milvus (SQLite模式) | 本地向量存储与检索 |
-| **Web框架** | FastAPI + Uvicorn | RESTful API服务 |
-| **文档处理** | pdfplumber + pandas | PDF文本与表格提取 |
-
-### 检索策略
+## 1. 架构
 
 ```
-用户问题
-    ├── 路径1: QA问答对召回（Milvus双索引）
-    │   ├── 稠密向量检索（语义搜索）
-    │   ├── 稀疏向量检索（BM25关键词搜索）
-    │   └── RRF算法融合排序
-    │
-    └── 路径2: PDF父文档召回（父子文档策略）
-        ├── 子文档（200字）→ 向量检索
-        └── 父文档（1000字）→ 上下文展示
-
-↓
-
-DeepSeek-Chat 生成最终答案
+                       ┌──────────────┐
+         用户问题 ─────►│   router     │  规则分类 + 急症识别
+                       └──────┬───────┘
+                    急症? ┌───┴───┐ 否
+                     ┌────▼──┐  ┌─▼──────────┐
+                     │safety │  │  retrieve  │  HybridSearch / ParentDoc
+                     └───┬───┘  └─┬──────────┘  按策略取 qa_k / pdf_k
+                         │      ┌─▼──────────┐
+                         │      │   verify   │  三维质量门（条数/长度/覆盖）
+                         │      └─┬──────────┘
+                         │   不达标 │ 且重试未超限
+                         │      ┌─▼──────────┐
+                         │      │   retry    │  计数 +1 并改写 query
+                         │      └─┬──────────┘
+                         │        └──────────► 回到 retrieve
+                         │      ┌─▼──────────┐
+                         │      │  generate  │  带引用编号生成 + 免责声明
+                         │      └─┬──────────┘
+                         ▼        ▼
+                        END      END
 ```
+
+### 为什么是图而不是一条 if-else 链
+
+`verify → retry → retrieve` 是一个**有环**结构，用函数顺序调用表达会变成
+手写 while 循环 + 局部变量堆积，状态散落各处。LangGraph 的 StateGraph 把
+"状态"和"转移"分开：节点只负责读 State、返回增量，转移由条件边决定。
+好处是重试次数、已用 query、降级标记这些都能通过 `checkpointer` 存档，
+按 `thread_id` 恢复——这是后面做多轮和人工介入（HITL）的前提。
 
 ---
 
-## 🚀 快速开始
+## 2. 目录结构
 
-### 1. 环境准备
-
-```bash
-# 安装依赖
-pip install fastapi uvicorn
-pip install pymilvus langchain-milvus
-pip install zhipuai pdfplumber openai
-pip install pandas tqdm requests
-
-# 下载Milvus（如未安装）
-# 本项目使用SQLite模式，无需单独安装Milvus服务
 ```
-
-### 2. 数据准备
-
-```bash
-# 1. 放置医学PDF教材到 pdf_documents/ 目录
-# 2. 运行PDF预处理
-python preprocess.py
-
-# 3. 构建向量数据库（如数据库文件不存在）
-python vectors1.py
-```
-
-### 3. 启动服务
-
-```bash
-# 启动RAG问答服务
-python agent.py
-
-# 服务将在 http://0.0.0.0:8103 启动
-```
-
-### 4. 运行测试
-
-```bash
-# 确保服务已启动后，在另一个终端运行
-python test.py
+medical-agent/
+├── agent.py                 # FastAPI 服务：中间件、异常出口、/metrics
+├── agents/medical_agent.py  # LangGraph 编排器（5 节点 + 2 条条件边）
+├── skills/                  # 能力层，只做一件事
+│   ├── hybrid_search.py     #   稠密 + BM25 + RRF 融合
+│   ├── parent_doc.py        #   父子文档召回
+│   └── answer_gen.py        #   LLM 生成
+├── core/                    # 与业务无关的横切能力
+│   ├── routing.py           #   问题分类 → 检索策略表
+│   ├── quality.py           #   检索质量三维判定
+│   ├── rewrite.py           #   二次检索 query 改写
+│   ├── rerank.py            #   可插拔重排（noop/keyword/cross_encoder）
+│   ├── citations.py         #   引用构造与 prompt 渲染
+│   ├── retry.py             #   指数退避（sleep 可注入，便于测试）
+│   ├── errors.py            #   异常体系：code / http_status / retryable
+│   ├── observability.py     #   trace_id + JSON Lines 日志 + span
+│   ├── state.py             #   AgentState 定义
+│   └── rrf.py               #   RRF 融合
+├── vectors1.py              # 离线入库（批量 embedding + 断点可重跑）
+├── preprocess.py            # PDF 结构化预处理
+├── tests/                   # 51 个用例，不需要任何 API Key
+├── Dockerfile / docker-compose.yml
+└── .env.example
 ```
 
 ---
 
-## 🧪 测试文件说明
+## 3. 快速开始
 
-`test.py` 包含以下6大测试模块：
+```bash
+cp .env.example .env          # 填 ZHIPU_API_KEY / DEEPSEEK_API_KEY
+pip install -r requirements.txt
+python vectors1.py            # 构建向量库（首次）
+python agent.py               # http://localhost:8103/docs
+pytest tests/ -q              # 51 passed
+```
 
-### ✅ 测试1: 向量数据库连接
-- 检查数据库文件完整性
-- 测试Milvus连接
-- 验证检索功能
+容器方式：
 
-### ✅ 测试2: 嵌入模型
-- 智谱Embedding-3单文本测试
-- 批量嵌入性能测试
+```bash
+docker compose up --build
+curl http://localhost:8103/api/health
+```
 
-### ✅ 测试3: 大语言模型
-- DeepSeek-Chat模型调用测试
-- 响应时间评估
-
-### ✅ 测试4: API服务
-- 服务健康检查
-- API问答接口测试
-
-### ✅ 测试5: 检索质量评估
-- 稠密向量 vs 混合检索对比
-- 多查询召回质量测试
-
-### ✅ 测试6: 端到端RAG问答
-- 完整双路召回流程
-- 答案生成质量评估
+> Milvus 本地文件模式（Lite）**不能多实例共享同一个 .db**。生产部署请换成
+> Milvus Standalone 服务地址，或保证每个副本独立库文件。
 
 ---
 
-## 📡 API接口
+## 4. 关键设计决策
 
-### 问答接口
+### 4.1 路由不是装饰品
 
-**请求:**
+原版 `_select_strategy()` 有六个分支，六个分支都返回 `"hybrid"`——路由存在但从不生效。
+现在 `core/routing.py` 是一张策略表：
+
+| 问题类型 | 策略 | qa_k | pdf_k | 上下文预算 |
+|---|---|---|---|---|
+| drug / diet | `hybrid_qa_heavy` | 15 | 1 | 4000 |
+| disease_definition / clinical | `hybrid_pdf_heavy` | 4 | 4 | 6000 |
+| diagnosis / prevention | `hybrid_wide` | 12 | 3 | 6000 |
+| general | `hybrid` | 10 | 3 | 5000 |
+| emergency | `qa_only` | 12 | 0 | 3000 |
+
+`tests/test_routing.py::test_strategies_are_actually_different` 断言策略参数至少有
+4 种不同组合——**防止再次退化成"路由空转"**。这类回归靠人眼是看不出来的。
+
+### 4.2 质量判定换掉"字符数 > 100"
+
+旧判定只看上下文长度，一段完全无关的长文也能通过。现在三个信号：
+
+- `doc_count` —— 有没有召回
+- `context_chars` —— 够不够支撑一段回答
+- `keyword_coverage` —— query 的字符二元组有多少出现在上下文里
+
+覆盖率用**字符二元组**而不是分词：中文医学实体（"非小细胞肺癌"）分词容易切碎，
+二元组对分词器零依赖，换模型不影响判定逻辑。
+`test_long_but_irrelevant_context_fails` 就是钉住这个漏洞的用例。
+
+### 4.3 重试是"改写后重试"，不是"原样再试"
+
+原样重试只会拿到同样的结果。`core/rewrite.py` 按轮次递进：
+第 1 次去停用词（"请问…有哪些" → 实体词），第 2 次加同义词扩展。
+`used_queries` 记录本轮用过哪些 query，结果按 `(doc_id, content[:60])` 去重，
+避免第二轮把第一轮的相同段落又塞一遍。
+
+### 4.4 重排可插拔、可降级
+
+| 策略 | 依赖 | 用途 |
+|---|---|---|
+| `noop` | 无 | 消融对比（关掉重排看指标差异） |
+| `keyword` | 无 | 默认。词面覆盖率 + 原排名分加权，CI 里无 GPU 也能验证链路 |
+| `cross_encoder` | sentence-transformers + 本地模型 | 懒加载，装不上自动退回 keyword 并标记 `degraded` |
+
+不做"重排后按阈值过滤"：分数阈值不可跨模型移植，卡阈值等于把模型版本焊死在业务代码里。
+
+### 4.5 引用是可追溯的，不是装饰
+
+`citations` 从 `[]` 变成 `{rank, doc_id, source, page, snippet}` 列表，
+去重键是 `(doc_id, page)`，同时以 `[1] 生理学.pdf 第 12 页` 的形式注入 prompt，
+让模型能按编号引用。用户点开引用能回到原文页——这是医疗场景的硬要求。
+
+### 4.6 急症直接短路
+
+`emergency`（胸痛/呼吸困难/昏迷/自杀倾向/服毒…）优先级高于所有分类，
+命中后**不检索、不生成**，直接返回就医指引 + 免责声明。
+理由：这类问题等一次 LLM 生成就是几十秒，且生成内容不可控。
+
+### 4.7 降级矩阵
+
+| 故障点 | 行为 | 用户看到 |
+|---|---|---|
+| HybridSearch 失败 | 记为"无 QA 上下文"，继续 ParentDoc | 正常答案，`degraded=true` |
+| ParentDoc 失败 | 同上，只用 QA | 正常答案 |
+| 两者都失败 | 上下文为空 → verify 不通过 → 重试 → 仍失败则生成兜底 | 提示信息不足并建议就医 |
+| LLM 失败（重试耗尽） | 返回"检索到的原文 + 无法生成" | 原文片段，可自行阅读 |
+| 重排模型不可用 | 退回 keyword 重排 | 体验无差异 |
+
+---
+
+## 5. API
+
+### `POST /api/chat`（推荐）
+
 ```bash
-POST http://localhost:8103/
-Content-Type: application/json
-
-{
-  "question": "糖尿病患者的饮食建议是什么？"
-}
+curl -X POST http://localhost:8103/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"question":"2型糖尿病患者的饮食禁忌有哪些？"}'
 ```
 
-**响应:**
 ```json
 {
-  "response": "根据医学资料，糖尿病患者应遵循以下饮食原则...",
-  "status": 200,
-  "time": "2026-05-09 20:43:06"
+  "answer": "……（末尾附免责声明）",
+  "thinking_steps": [
+    "[Router] 类型=diet 策略=hybrid_qa_heavy (qa_k=15, pdf_k=1)",
+    "[Retrieve] HybridSearch 命中 15 条（hybrid_dense+bm25+rrf）",
+    "[Retrieve] keyword 重排 15 条",
+    "[Verify] 通过：15 条 / 4380 字符 / 覆盖 85%",
+    "[Generate] 生成 620 字符，引用 5 处"
+  ],
+  "citations": [{"rank": 1, "doc_id": "…", "source": "生理学.pdf", "page": 12, "snippet": "…"}],
+  "quality": {"passed": true, "coverage": 0.85, "context_chars": 4380, "doc_count": 15},
+  "retry_count": 0,
+  "emergency": false,
+  "degraded": false,
+  "trace_id": "6f1c…",
+  "elapsed_seconds": 3.42
 }
 ```
 
----
+`thinking_steps` 不是日志，是**给排障和给面试官看的东西**：
+"为什么这次慢"、"为什么答案里没有引用"、"重试了几轮"，看一眼就知道。
 
-## 📊 项目特色
+### 其它端点
 
-### 1️⃣ 双路混合检索
-- **稠密向量检索**：理解语义（如"血糖"和"糖尿病"关联）
-- **稀疏向量检索**：精确匹配关键词（如专业术语）
-- **RRF融合算法**：智能排序，平衡语义与关键词
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/` | 兼容旧前端的简化接口 |
+| GET | `/api/health` | 健康检查（免限流免认证） |
+| GET | `/api/skills` | Skills 清单与参数定义 |
+| GET | `/metrics` | 请求量 / 错误 / 超时 / 限流 / 急症 / 降级 |
 
-### 2️⃣ 父子文档策略
-- **子文档**：200字小块，提高检索召回率
-- **父文档**：1000字大块，提供完整上下文
+错误统一出口：
 
-### 3️⃣ 多数据源融合
-- QA问答对（`data.jsonl`）
-- 医学PDF教材（生物化学、生理学、微生物学）
-- 动态上下文组合
-
-### 4️⃣ 医学专业提示词
-```python
-SYSTEM_PROMPT = "System:你是一个非常得力的医学助手,你可以通过从数据库中检索出的信息找到问题的答案。"
+```json
+{"error": {"code": "upstream_timeout", "message": "…", "retryable": true}, "trace_id": "6f1c…"}
 ```
 
 ---
 
-## 🎯 使用示例
-
-### Python调用示例
-
-```python
-import requests
-
-# 1. 发送问题
-response = requests.post(
-    "http://localhost:8103/",
-    json={"question": "什么是糖尿病？"},
-    timeout=30
-)
-
-# 2. 获取答案
-result = response.json()
-print(result["response"])
-```
-
-### cURL调用示例
+## 6. 测试
 
 ```bash
-curl -X POST http://localhost:8103/ \
-  -H "Content-Type: application/json" \
-  -d '{"question": "糖尿病的饮食禁忌有哪些？"}'
+pytest tests/ -q      # 51 passed，不需要任何 API Key
 ```
 
----
+| 文件 | 覆盖内容 |
+|---|---|
+| `test_routing.py` | 分类、策略表、急症短路、**防"路由空转"回归** |
+| `test_quality_rewrite.py` | 三维质量门、长而无关的上下文被拦、改写递进 |
+| `test_retry.py` | 退避递增、`max_delay` 上限、不可重试异常不重试 |
+| `test_citations.py` | 去重、截断、prompt 渲染、空输入 |
+| `test_rerank.py` | 排序稳定性、脏输入、主路失败走备路 |
+| `test_agent_graph.py` | 真实跑 LangGraph 图：急症短路 / 一次通过 / 改写重试 / 重试上限 / 去重 / 预算丢弃 |
 
-## 📝 配置说明
-
-### API密钥配置
-
-在 `agent.py` 和 `model1.py` 中：
-
-```python
-# 智谱AI API Key（用于Embedding）
-ZHIPU_API_KEY = "your_zhipu_api_key_here"
-
-# DeepSeek API Key（用于LLM）
-DEEPSEEK_API_KEY = "your_deepseek_api_key_here"
-```
-
-### 服务端口配置
-
-```python
-# 在 agent.py 最后一行
-uvicorn.run(app, host='0.0.0.0', port=8103, workers=1)
-```
+集成测试用 `FakeSkill` + `FakeAnswer` 替掉外部依赖，所以能进 CI——
+**"需要真 Key 才能测"等于"从来没人测"**。
 
 ---
 
-## 🔧 故障排查
+## 7. 已知边界（没做的部分，以及为什么）
 
-### 问题1: CUDA驱动版本过旧警告
-```
-UserWarning: CUDA initialization: The NVIDIA driver on your system is too old
-```
-**解决方案**：忽略即可，本项目默认使用CPU运行
+诚实列出来，比写成"已完成"更有用：
 
-### 问题2: Pydantic兼容性警告
-**解决方案**：已在代码中添加兼容性补丁（无需处理）
-
-### 问题3: API连接失败
-**解决方案**：检查API Key是否正确，网络是否正常
-
----
-
-## 📈 后续优化方向
-
-1. **性能优化**
-   - [ ] 添加Redis缓存层
-   - [ ] 实现批量查询接口
-   - [ ] 向量数据库索引优化
-
-2. **功能扩展**
-   - [ ] 添加对话历史记忆
-   - [ ] 实现答案来源溯源
-   - [ ] 支持多轮对话
-
-3. **部署优化**
-   - [ ] Docker容器化
-   - [ ] 负载均衡配置
-   - [ ] 监控日志系统
+1. **限流在进程内存**：`RATE_LIMIT_REQUESTS` 用 dict 计数，多 worker 各自计，
+   实际额度会翻倍。上生产换 Redis 或网关限流。
+2. **指标未接 Prometheus**：`/metrics` 返回进程内数字，重启即清零，
+   且多副本要自己汇总。接 `prometheus_client` 是下一步。
+3. **BM25 索引全量驻留内存**：十万级文档内存吃紧，且无法增量更新
+   （新文档必须重启进程才进索引）。正解是换 Milvus 的 sparse 倒排或 Elasticsearch。
+4. **无多轮上下文**：State 支持 `thread_id` 复用，但没有做"指代消解"
+   （"它有什么副作用"里的"它"指什么）。
+5. **无自动评测集**：只有单测和人工抽查，没有 recall@k / 答案忠实度的
+   离线评测。要做的话先攒 100 条 query-answer 对当金标。
+6. **`test.py` 是手工验收脚本**，不是自动化测试，跑起来要真 Key、要服务在跑。
 
 ---
 
-## 👨‍🎓 作者信息
+## 8. 技术栈
 
-- **项目名称**: 医学RAG问答系统
-- **项目类型**: 毕业设计
-- **完成时间**: 2026年5月
-- **技术栈**: Python + FastAPI + Milvus + DeepSeek
+Python 3.11 / FastAPI / LangGraph / Milvus(Lite) / 智谱 embedding-3(1024d) /
+DeepSeek-Chat / rank-bm25 + jieba / Docker
 
 ---
 
-## 📄 许可证
+## 9. 免责声明
 
-本项目仅用于学习与研究目的。
-
----
-
-**🎉 祝答辩顺利！**
+本项目仅用于学习与研究，**不构成任何医疗建议**。所有回答末尾附带免责声明；
+涉及急症的一律引导至线下就医。
