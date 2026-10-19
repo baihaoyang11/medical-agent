@@ -7,7 +7,7 @@
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                     FastAPI 服务层                        │
-│  POST / (兼容前端)  │  POST /api/chat (展示用)           │
+│  POST / (兼容前端)  │  POST /api/chat (思考链)           │
 │  GET /api/skills    │  GET /api/health                   │
 └────────────────────────┬────────────────────────────────┘
                          │
@@ -21,7 +21,7 @@
 │        分析问题类型   调用Skills   质量检查    LLM生成     │
 │        选择检索策略   收集上下文   决定重试    最终答案     │
 │                                                          │
-│  每个节点记录 thinking_steps（面试展示用）                │
+│  每个节点记录 thinking_steps（决策可追溯）                │
 └────────────────────────┬────────────────────────────────┘
                          │
                          ▼
@@ -104,7 +104,7 @@
 ## 代码结构
 
 ```
-医学RAG/
+medical-agent/
 ├── agent.py               # FastAPI入口 + Agent/Skill初始化
 ├── config.py              # 集中配置管理 (API Key/路径/参数)
 ├── model1.py              # 模型层 (ZhipuAI Embedding + DeepSeek LLM)

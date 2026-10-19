@@ -1,6 +1,6 @@
 # 🎨 医学RAG问答系统 - 前端界面
 
-现代化的聊天式问答界面，专为毕业答辩展示设计。
+聊天式问答界面，用于展示检索到的证据与答案生成过程。
 
 ---
 
@@ -23,8 +23,8 @@ frontend/
 **打开第一个终端窗口：**
 
 ```bash
-cd /path/to/medical-agent
-python agent.py
+cd <项目根目录>
+python tasks.py serve
 ```
 
 等待看到类似以下输出：
@@ -51,13 +51,8 @@ INFO:     Uvicorn running on http://0.0.0.0:8103
 如果遇到跨域问题，可以使用简单的 HTTP 服务器：
 
 ```bash
-cd /path/to/medical-agent/frontend
-
-# Python 3
+cd frontend
 python -m http.server 8000
-
-# 或者 Python 2
-python -m SimpleHTTPServer 8000
 ```
 
 然后在浏览器打开：`http://localhost:8000`
@@ -162,8 +157,8 @@ const API_BASE_URL = 'http://192.168.1.100:8103';
 **解决方法**：
 ```bash
 # 确保后端服务正在运行
-cd /path/to/medical-agent
-python agent.py
+cd <项目根目录>
+python tasks.py serve
 ```
 
 ### 2. 提示"CORS错误"或"跨域问题"

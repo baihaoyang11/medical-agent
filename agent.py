@@ -391,7 +391,7 @@ async def chatbot(request: Request):
 )
 async def agent_chat(request: ChatRequest, req: Request):
     """
-    Agent 思考链可视化问答接口（面试展示用）
+    Agent 思考链可视化问答接口。
 
     Request:  {"question": "糖尿病的饮食禁忌有哪些？"}
     Response: {
