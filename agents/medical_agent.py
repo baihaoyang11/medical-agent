@@ -1,329 +1,407 @@
-"""
-医学问答 Agent — 基于 LangGraph 的 Agent 编排器
+"""医学问答 Agent — 基于 LangGraph 的编排器（企业化改造版）
 
-Agent 工作流（4 节点有向图）：
+工作流（4 节点 + 1 安全通道）：
 
     START
       │
       ▼
-  ┌─────────┐
-  │ router  │ ── 分析问题类型，决定检索策略
-  └────┬────┘
-       │
-       ▼
-  ┌──────────┐
-  │ retrieve │ ── 调用 HybridSearch + ParentDoc Skills
-  └────┬─────┘
-       │
-       ▼
-  ┌────────┐
-  │ verify │ ── 检查检索质量，决定是否需要补充检索
-  └───┬────┘
+   router ── 急症? ──► safety（直接给就医指引，不检索不生成）
       │
       ▼
-  ┌──────────┐
-  │ generate │ ── 调用 AnswerGeneration Skill 生成最终答案
-  └────┬─────┘
-       │
-       ▼
-      END
+   retrieve ── 按策略调 HybridSearch / ParentDoc，失败降级
+      │
+      ▼
+   verify ── 质量判定（条数 / 长度 / 关键词覆盖）
+      │
+      ├── 不达标且未超次数 ──► retrieve（改写 query 重试）
+      ▼
+   generate ── 带引用编号生成答案
+      │
+      ▼
+     END
 
-每个节点将思考步骤追加到 thinking_steps（面试展示用）。
+相对旧版的四类改动：
+1. 路由真的分流：策略表决定 qa_k / pdf_k / 上下文预算，不再是六个分支返回同一个值
+2. 条件边真的回退：retry_count + query 改写 + 结果去重，最多 MAX_RETRIES 次
+3. 质量判定从"字符数 > 100"升级为三维信号（见 core/quality.py）
+4. 补上 citations 与 checkpointer：引用可追溯，状态可通过 thread_id 恢复
 """
 
-from typing import Dict, Any, Literal
-from langgraph.graph import StateGraph, END
+from __future__ import annotations
 
+import uuid
+from typing import Any, Dict, Literal
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph
+
+from core.citations import build_citations, render_for_prompt
+from core.observability import log, span
+from core.quality import assess
+from core.rerank import Reranker, build_reranker
+from core.retry import call_with_retry
+from core.rewrite import rewrite
+from core.routing import resolve
 from core.state import AgentState
-from core.base_skill import SkillResult
-from skills.hybrid_search import HybridSearchSkill
-from skills.parent_doc import ParentDocSearchSkill
-from skills.answer_gen import AnswerGenerationSkill
+
+# 二次检索最多再补 2 次（总检索 3 次）
+MAX_RETRIES = 2
+
+EMERGENCY_REPLY = (
+    "你描述的情况可能属于需要紧急处理的情况。请立即拨打 120 或尽快前往最近的急诊科，"
+    "不要等待线上回复，也不要自行用药。如果身边有人，请让对方陪同。"
+    "本系统只能提供一般性医学知识，不能替代医生的现场判断。"
+)
+
+DISCLAIMER = "以上内容仅供参考，不能替代专业医生的诊断和治疗建议；如有不适请及时就医。"
 
 
 class MedicalAgent:
-    """
-    医学问答 Agent
-
-    使用 LangGraph StateGraph 编排 Skill 调用流程：
-    router → retrieve → verify → generate
-
-    特点：
-    - Agent 自主分析问题类型（疾病定义/用药咨询/饮食建议/鉴别诊断等）
-    - Agent 自主选择检索策略（QA库/PDF教材/混合）
-    - 检索质量不足时自动触发二次检索
-    - 全程记录 thinking_steps 供面试展示
-    """
+    """医学问答 Agent，使用 LangGraph StateGraph 编排 Skill 调用。"""
 
     def __init__(
         self,
-        hybrid_search_skill: HybridSearchSkill,
-        parent_doc_skill: ParentDocSearchSkill,
-        answer_gen_skill: AnswerGenerationSkill,
-    ):
+        hybrid_search_skill: Any,
+        parent_doc_skill: Any,
+        answer_gen_skill: Any,
+        *,
+        max_retries: int = MAX_RETRIES,
+        checkpointer: Any | None = None,
+        reranker: Reranker | None = None,
+    ) -> None:
         self.hybrid_search = hybrid_search_skill
         self.parent_doc = parent_doc_skill
         self.answer_gen = answer_gen_skill
+        self.max_retries = max_retries
+        self._checkpointer = checkpointer or MemorySaver()
+        # 不传就用默认策略（config 里可改），传对象则完全接管
+        if reranker is None:
+            from config import config as _cfg
 
-        # 构建 LangGraph 工作流
+            reranker = build_reranker(
+                _cfg.RERANK_STRATEGY,
+                model_path=_cfg.RERANK_MODEL_PATH,
+                weight=_cfg.RERANK_WEIGHT,
+            )
+        self._reranker = reranker
         self._graph = self._build_graph()
 
     # ================================================================
-    # 节点 1: 路由 — 分析问题类型，决定检索策略
+    # 节点 1：路由
     # ================================================================
     def _router_node(self, state: AgentState) -> Dict[str, Any]:
-        """路由节点：Agent 分析用户意图，决定最优检索策略"""
         query = state.get("query", "")
+        decision = resolve(query)
 
-        # Agent 决策逻辑：基于关键词判断问题类型
-        question_type = self._classify_question(query)
-        strategy = self._select_strategy(question_type)
+        if decision.emergency:
+            step = f"[Router] 命中急症关键词 {list(decision.matched)} → 走安全通道"
+        else:
+            step = (
+                f"[Router] 类型={decision.question_type} 策略={decision.strategy} "
+                f"(qa_k={decision.params.qa_k}, pdf_k={decision.params.pdf_k})"
+            )
 
-        step = (
-            f"[Router Agent] 分析问题: \"{query[:50]}...\" → "
-            f"类型: {question_type}, 策略: {strategy}"
-        )
+        log("route", **decision.to_trace())
 
         return {
-            "question_type": question_type,
-            "retrieval_strategy": strategy,
+            "question_type": decision.question_type,
+            "retrieval_strategy": decision.strategy,
+            "emergency": decision.emergency,
+            "route_matched": list(decision.matched),
+            "effective_query": rewrite(query, 1),
+            "used_queries": [query],
+            "retry_count": 0,
             "thinking_steps": [step],
         }
 
-    def _classify_question(self, query: str) -> str:
-        """基于关键词规则判断医学问题类型"""
-        q_lower = query.lower()
-        if any(w in q_lower for w in ["饮食", "吃什么", "禁忌", "营养", "食谱"]):
-            return "diet"
-        elif any(w in q_lower for w in ["区别", "鉴别", "还是", "怎么区分", "不同"]):
-            return "diagnosis"
-        elif any(w in q_lower for w in ["药", "治疗", "用药", "剂量", "处方"]):
-            return "drug"
-        elif any(w in q_lower for w in ["预防", "感染", "传播", "传染", "疫苗"]):
-            return "prevention"
-        elif any(w in q_lower for w in ["定义", "什么是", "是什么", "解释", "概念"]):
-            return "disease_definition"
-        elif any(w in q_lower for w in ["症状", "表现", "诊断", "检查", "指标", "正常值"]):
-            return "clinical"
-        else:
-            return "general"
-
-    def _select_strategy(self, question_type: str) -> str:
-        """根据问题类型选择检索策略"""
-        if question_type in ("disease_definition", "clinical", "drug"):
-            return "hybrid"       # 需要精确术语匹配 + 语义理解
-        elif question_type in ("diagnosis",):
-            return "hybrid"       # 鉴别诊断需要多维度检索
-        elif question_type in ("prevention", "diet"):
-            return "hybrid"       # 预防和饮食建议需要 QA + 教材
-        else:
-            return "hybrid"       # 默认混合检索
+    # ================================================================
+    # 节点：安全通道
+    # ================================================================
+    def _safety_node(self, state: AgentState) -> Dict[str, Any]:
+        return {
+            "final_answer": f"{EMERGENCY_REPLY}\n\n{DISCLAIMER}",
+            "citations": [],
+            "degraded": False,
+            "thinking_steps": ["[Safety] 急症场景，跳过检索与生成，直接输出就医指引"],
+        }
 
     # ================================================================
-    # 节点 2: 检索 — 调用 Skills 收集上下文
+    # 节点 2：检索
     # ================================================================
     def _retrieve_node(self, state: AgentState) -> Dict[str, Any]:
-        """检索节点：Agent 调用 HybridSearch 和 ParentDoc Skills"""
-        query = state["query"]
-        strategy = state.get("retrieval_strategy", "hybrid")
-        steps = []
+        query = state.get("effective_query") or state["query"]
+        retry_count = state.get("retry_count", 0)
+        params = resolve(state["query"]).params
+        steps: list[str] = []
 
-        qa_context = ""
-        pdf_context = ""
+        qa_docs: list[dict[str, Any]] = []
+        pdf_docs: list[dict[str, Any]] = []
 
-        # 调用 Skill 1: 混合检索（QA问答对库）
-        if strategy in ("qa_only", "hybrid"):
-            result = self.hybrid_search.execute(query=query, k=10)
-            if result["success"] and result["data"]:
-                qa_context = "\n\n".join(
-                    doc["content"] for doc in result["data"]
+        if params.use_qa:
+            with span("skill.hybrid_search", k=params.qa_k, attempt=retry_count + 1):
+                result = call_with_retry(
+                    self.hybrid_search.execute,
+                    query=query,
+                    k=params.qa_k,
+                    op_name="hybrid_search",
                 )
+            if result.get("success"):
+                qa_docs = list(result.get("data") or [])
+                method = (result.get("metadata") or {}).get("method")
+                steps.append(f"[Retrieve] HybridSearch 命中 {len(qa_docs)} 条（{method}）")
+            else:
+                # 检索失败降级为"没有 QA 上下文"，不让整条链路 500
+                steps.append(f"[Retrieve] HybridSearch 失败已降级：{result.get('error')}")
+
+        if params.use_pdf:
+            with span("skill.parent_doc_search", k=params.pdf_k, attempt=retry_count + 1):
+                result = call_with_retry(
+                    self.parent_doc.execute,
+                    query=query,
+                    k=params.pdf_k,
+                    op_name="parent_doc_search",
+                )
+            if result.get("success"):
+                pdf_docs = list(result.get("data") or [])
+                sources = sorted({d.get("source") for d in pdf_docs if d.get("source")})
                 steps.append(
-                    f"[Retrieve Agent] 调用 HybridSearch Skill → "
-                    f"从QA库召回 {result['metadata']['count']} 条文档"
+                    f"[Retrieve] ParentDoc 命中 {len(pdf_docs)} 段父文档（{', '.join(sources) or '无来源'}）"
                 )
             else:
-                steps.append(
-                    f"[Retrieve Agent] 调用 HybridSearch Skill → "
-                    f"QA库无相关结果"
-                )
+                steps.append(f"[Retrieve] ParentDoc 失败已降级：{result.get('error')}")
 
-        # 调用 Skill 2: PDF教材检索
-        if strategy in ("pdf_only", "hybrid"):
-            result = self.parent_doc.execute(query=query, k=3)
-            if result["success"] and result["data"]:
-                pdf_context = "\n\n".join(
-                    doc["content"] for doc in result["data"]
-                )
-                sources = [d["source"] for d in result["data"] if d.get("source")]
-                steps.append(
-                    f"[Retrieve Agent] 调用 ParentDocSearch Skill → "
-                    f"从PDF教材召回 {result['metadata']['count']} 条段落 "
-                    f"({', '.join(sources[:2])})"
-                )
-            else:
-                steps.append(
-                    f"[Retrieve Agent] 调用 ParentDocSearch Skill → "
-                    f"PDF教材无相关结果"
-                )
+        merged = _dedupe(qa_docs + pdf_docs)
 
-        # 拼接最终上下文
-        final_context_parts = []
-        if qa_context:
-            final_context_parts.append(f"[QA问答对数据库]\n{qa_context}")
-        if pdf_context:
-            final_context_parts.append(f"[PDF医学教材]\n{pdf_context}")
-        final_context = "\n\n---\n\n".join(final_context_parts)
+        # 融合只用了排名信息，尺度不可比；重排把"真正答这个问题"的段落提到前面，
+        # 上下文预算按重要性分配才有意义（超预算时丢的是尾部）。
+        if merged and getattr(self._reranker, "name", "noop") != "noop":
+            with span("rerank", strategy=self._reranker.name, docs=len(merged)):
+                merged = self._reranker.rerank(query, merged)
+            mark = "（已降级）" if getattr(self._reranker, "degraded", False) else ""
+            steps.append(f"[Retrieve] {self._reranker.name} 重排 {len(merged)} 条{mark}")
+
+        context = _compose_context(merged, params.max_context_chars)
 
         steps.append(
-            f"[Retrieve Agent] 上下文聚合完成 → "
-            f"总长度 {len(final_context)} 字符"
+            f"[Retrieve] 去重后 {len(merged)} 条，上下文 {len(context)} 字符"
+            f"（预算 {params.max_context_chars}）"
         )
 
         return {
-            "final_context": final_context,
+            "qa_docs": qa_docs,
+            "pdf_docs": pdf_docs,
+            "merged_docs": merged,
+            "final_context": context,
+            "used_queries": [query],
             "thinking_steps": steps,
         }
 
     # ================================================================
-    # 节点 3: 验证 — 检查检索质量
+    # 节点 3：质量校验
     # ================================================================
     def _verify_node(self, state: AgentState) -> Dict[str, Any]:
-        """验证节点：Agent 检查检索结果质量，决定是否需要补充检索"""
-        context = state.get("final_context", "")
-        need_secondary = len(context.strip()) < 100  # 上下文太少则标记
+        report = assess(
+            state.get("query", ""),
+            state.get("merged_docs", []),
+            state.get("final_context", ""),
+        )
+        retry_count = state.get("retry_count", 0)
+        need_retry = (not report.passed) and retry_count < self.max_retries
 
-        if need_secondary:
+        if report.passed:
             step = (
-                f"[Verify Agent] 检索质量检查 → 上下文不足({len(context)}字符)，"
-                f"标记需要二次检索"
+                f"[Verify] 通过：{report.doc_count} 条 / {report.context_chars} 字符"
+                f" / 覆盖 {report.coverage:.0%}"
+            )
+        elif need_retry:
+            step = (
+                f"[Verify] 不通过（{'；'.join(report.reasons)}）"
+                f"→ 第 {retry_count + 1} 次改写重试"
             )
         else:
-            step = (
-                f"[Verify Agent] 检索质量检查 → 通过 "
-                f"(上下文 {len(context)} 字符)"
-            )
+            step = f"[Verify] 不通过（{'；'.join(report.reasons)}）且已达重试上限 → 降级生成"
+
+        log(
+            "verify",
+            passed=report.passed,
+            need_retry=need_retry,
+            retry_count=retry_count,
+            reasons=report.reasons,
+        )
 
         return {
-            "need_secondary_search": need_secondary,
+            "quality": report.to_trace(),
+            "need_secondary_search": need_retry,
             "thinking_steps": [step],
         }
 
     # ================================================================
-    # 节点 4: 生成 — 调用 LLM 生成最终答案
+    # 节点 4：生成
     # ================================================================
     def _generate_node(self, state: AgentState) -> Dict[str, Any]:
-        """生成节点：Agent 调用 AnswerGeneration Skill 生成最终答案"""
-        query = state["query"]
+        citations = build_citations(state.get("merged_docs", []))
         context = state.get("final_context", "")
 
-        result = self.answer_gen.execute(query=query, context=context)
+        citation_block = render_for_prompt(citations)
+        if citation_block:
+            context = f"{context}\n\n[可引用来源]\n{citation_block}"
 
-        if result["success"]:
-            answer = result["data"]
-            step = (
-                f"[Generate Agent] 调用 AnswerGeneration Skill → "
-                f"DeepSeek-Chat 生成答案 ({len(answer)} 字符)"
+        with span("skill.answer_generation", citations=len(citations)):
+            result = call_with_retry(
+                self.answer_gen.execute,
+                query=state["query"],
+                context=context,
+                op_name="answer_generation",
             )
+
+        if result.get("success"):
+            answer = str(result.get("data") or "")
+            step = f"[Generate] 生成 {len(answer)} 字符，引用 {len(citations)} 处"
         else:
-            answer = f"抱歉，答案生成失败：{result['error']}"
-            step = (
-                f"[Generate Agent] 调用 AnswerGeneration Skill → "
-                f"生成失败: {result['error']}"
-            )
+            answer = "抱歉，答案生成暂时不可用，请稍后重试。"
+            step = f"[Generate] 生成失败：{result.get('error')}"
+
+        degraded = bool(state.get("need_secondary_search")) or not citations
 
         return {
-            "final_answer": answer,
+            "final_answer": f"{answer}\n\n{DISCLAIMER}",
+            "citations": citations,
+            "degraded": degraded,
             "thinking_steps": [step],
         }
 
     # ================================================================
-    # 条件路由：验证后是否需要二次检索
+    # 条件边
     # ================================================================
-    def _should_retrieve_again(self, state: AgentState) -> Literal["retrieve", "generate"]:
-        """条件边：如果验证不过且未超过2次检索，则重新检索"""
-        if state.get("need_secondary_search", False):
-            # 简单起见，当前不实现二次检索循环（可扩展）
-            # 直接走生成节点，让 LLM 基于有限信息回答
-            return "generate"
-        return "generate"
+    def _after_route(self, state: AgentState) -> Literal["safety", "retrieve"]:
+        return "safety" if state.get("emergency") else "retrieve"
+
+    def _after_verify(self, state: AgentState) -> Literal["retrieve", "generate"]:
+        return "retrieve" if state.get("need_secondary_search") else "generate"
+
+    def _bump_retry(self, state: AgentState) -> Dict[str, Any]:
+        """进入下一轮检索前：retry_count +1，并改写 query。
+
+        注意：LangGraph 的节点函数不能直接放在条件边返回的路径上，
+        这里通过 retrieve 节点的入口统一调用（见 _build_graph 的 retry 节点）。
+        """
+        next_count = state.get("retry_count", 0) + 1
+        new_query = rewrite(state["query"], attempt=next_count + 1)
+        log(
+            "retry_rewrite",
+            attempt=next_count,
+            from_query=state.get("effective_query"),
+            to_query=new_query,
+        )
+        return {
+            "retry_count": next_count,
+            "effective_query": new_query,
+            "thinking_steps": [f"[Retrieve] 第 {next_count} 次改写：{new_query}"],
+        }
 
     # ================================================================
-    # 构建 LangGraph 工作流
+    # 构图
     # ================================================================
     def _build_graph(self):
-        """构建 StateGraph"""
         workflow = StateGraph(AgentState)
 
-        # 添加节点
         workflow.add_node("router", self._router_node)
+        workflow.add_node("safety", self._safety_node)
         workflow.add_node("retrieve", self._retrieve_node)
         workflow.add_node("verify", self._verify_node)
         workflow.add_node("generate", self._generate_node)
+        workflow.add_node("retry", self._bump_retry)
 
-        # 添加边
         workflow.set_entry_point("router")
-        workflow.add_edge("router", "retrieve")
-        workflow.add_edge("retrieve", "verify")
         workflow.add_conditional_edges(
-            "verify",
-            self._should_retrieve_again,
-            {
-                "retrieve": "retrieve",
-                "generate": "generate",
-            }
+            "router", self._after_route, {"safety": "safety", "retrieve": "retrieve"}
         )
+        workflow.add_edge("retrieve", "verify")
+        # 不达标 → 先经过 retry 节点计数并改写 query，再回 retrieve
+        workflow.add_conditional_edges(
+            "verify", self._after_verify, {"retrieve": "retry", "generate": "generate"}
+        )
+        workflow.add_edge("retry", "retrieve")
         workflow.add_edge("generate", END)
+        workflow.add_edge("safety", END)
 
-        return workflow.compile()
+        return workflow.compile(checkpointer=self._checkpointer)
 
     # ================================================================
     # 公共接口
     # ================================================================
-    def run(self, query: str) -> Dict[str, Any]:
-        """
-        运行 Agent 处理一个用户问题
+    def run(self, query: str, thread_id: str | None = None) -> Dict[str, Any]:
+        """执行一次问答。
 
-        Args:
-            query: 用户输入的医学问题
-
-        Returns:
-            {
-                "answer": str,           # 最终答案
-                "thinking_steps": [...], # Agent思考链
-                "question_type": str,    # 问题类型
-                "retrieval_strategy": str, # 检索策略
-                "context_length": int,   # 检索到的上下文长度
-            }
+        thread_id 相同则复用检查点（多轮场景）；不传则每次新建，
+        避免上一轮状态污染下一轮。
         """
-        initial_state: AgentState = {
+        initial: AgentState = {
             "query": query,
-            "qa_retrieved_docs": [],
-            "pdf_retrieved_content": "",
-            "final_context": "",
-            "question_type": "",
-            "retrieval_strategy": "",
-            "need_secondary_search": False,
-            "final_answer": "",
-            "citations": [],
             "thinking_steps": [],
+            "citations": [],
+            "retry_count": 0,
+            "need_secondary_search": False,
+            "degraded": False,
         }
 
-        # 执行 Agent 工作流
-        final_state = self._graph.invoke(initial_state)
+        config = {"configurable": {"thread_id": thread_id or uuid.uuid4().hex}}
+
+        with span("agent.run", thread_id=config["configurable"]["thread_id"]):
+            final = self._graph.invoke(initial, config)
 
         return {
-            "answer": final_state.get("final_answer", ""),
-            "thinking_steps": final_state.get("thinking_steps", []),
-            "question_type": final_state.get("question_type", ""),
-            "retrieval_strategy": final_state.get("retrieval_strategy", ""),
-            "context_length": len(final_state.get("final_context", "")),
+            "answer": final.get("final_answer", ""),
+            "thinking_steps": final.get("thinking_steps", []),
+            "question_type": final.get("question_type", "general"),
+            "retrieval_strategy": final.get("retrieval_strategy", "hybrid"),
+            "context_length": len(final.get("final_context", "")),
+            "citations": final.get("citations", []),
+            "quality": final.get("quality", {}),
+            "retry_count": final.get("retry_count", 0),
+            "emergency": bool(final.get("emergency")),
+            "degraded": bool(final.get("degraded")),
         }
 
     def get_skill_registry(self) -> Dict[str, Any]:
-        """返回 Skill 注册表，供外部查询 Agent 拥有哪些能力"""
         return {
             self.hybrid_search.name: self.hybrid_search.to_tool_definition(),
             self.parent_doc.name: self.parent_doc.to_tool_definition(),
             self.answer_gen.name: self.answer_gen.to_tool_definition(),
         }
+
+
+# ====================================================================
+# 纯函数：上下文装配与去重（拆出来便于单测）
+# ====================================================================
+
+def _dedupe(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按 (doc_id, 内容前 60 字) 去重，保留首次出现。
+
+    只用 doc_id 不够：同一父文档的不同段落 doc_id 相同但内容不同。
+    """
+    seen: set[tuple[str, str]] = set()
+    out: list[dict[str, Any]] = []
+    for d in docs:
+        content = str(d.get("content") or d.get("text") or "")
+        key = (str(d.get("doc_id") or ""), content[:60])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
+
+
+def _compose_context(docs: list[dict[str, Any]], budget: int) -> str:
+    """按预算拼上下文。超预算时整段丢弃，而不是截断——半句话比没有更危险。"""
+    parts: list[str] = []
+    used = 0
+    for d in docs:
+        content = str(d.get("content") or d.get("text") or "").strip()
+        if not content:
+            continue
+        if used + len(content) > budget and parts:
+            break
+        parts.append(content)
+        used += len(content)
+    return "\n\n---\n\n".join(parts)
