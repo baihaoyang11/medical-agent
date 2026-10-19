@@ -1,37 +1,52 @@
-"""
-Agent 状态定义 — LangGraph StateGraph 的核心数据结构
+"""Agent 状态定义 — LangGraph StateGraph 的核心数据结构。
 
-定义了 Agent 在各个节点之间传递的状态字段，
-包括检索结果、思考步骤、最终答案等。
+相对旧版的改动：
+- 增加 effective_query / used_queries / retry_count，支撑真正的二次检索
+- 增加 merged_docs / quality / citations，让引用与质量判定有地方落
+- emergency 单列，急症走安全通道，不进检索
 """
 
-from typing import TypedDict, List, Dict, Any, Annotated
+from __future__ import annotations
+
 from operator import add
+from typing import Annotated, Any, Dict, List, TypedDict
 
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
+    """Agent 全局状态。
+
+    thinking_steps 用 Annotated[list, add] 声明 reducer：节点返回的列表会
+    自动追加而不是覆盖，这样轨迹是完整累积的。
     """
-    Agent 全局状态，在 LangGraph 各节点间流转
 
-    使用 Annotated[list, add] 的字段会自动累加（而非覆盖），
-    适合记录思考步骤这类需要追加的数据。
-    """
-    # 用户输入
+    # 输入
     query: str
+    effective_query: str
+
+    # 路由
+    question_type: str
+    retrieval_strategy: str
+    emergency: bool
+    route_matched: List[str]
+
+    # 二次检索控制
+    retry_count: int
+    used_queries: List[str]
+    need_secondary_search: bool
 
     # 检索结果
-    qa_retrieved_docs: List[str]          # QA库检索到的文档内容
-    pdf_retrieved_content: str            # PDF父文档召回的内容
-    final_context: str                    # 拼接后的最终上下文
+    qa_docs: List[Dict[str, Any]]
+    pdf_docs: List[Dict[str, Any]]
+    merged_docs: List[Dict[str, Any]]
+    final_context: str
 
-    # Agent 决策
-    question_type: str                    # 问题类型: disease/drug/diagnosis/diet/prevention/general
-    retrieval_strategy: str               # 检索策略: qa_only/pdf_only/hybrid
-    need_secondary_search: bool           # 是否需要二次检索
+    # 质量与引用
+    quality: Dict[str, Any]
+    citations: List[Dict[str, Any]]
 
     # 输出
-    final_answer: str                     # 最终答案
-    citations: List[Dict[str, str]]       # 引用来源列表
+    final_answer: str
+    degraded: bool
 
-    # 思考链（面试展示用，使用 add reducer 自动累加）
+    # 轨迹
     thinking_steps: Annotated[List[str], add]
