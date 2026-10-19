@@ -13,13 +13,14 @@ def rrf_merge(
     sparse_results: List[Dict[str, Any]],
     rrf_k: int = 60,
     top_n: Optional[int] = None,
+    weights: Optional[tuple[float, float]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Reciprocal Rank Fusion 融合排序
 
-    RRF 分数 = Σ 1 / (k + rank(doc))
+    RRF 分数 = Σ w_i / (k + rank_i(doc))
 
-    其中 rank(doc) 是文档在某个检索方式中的排名（从1开始），
+    其中 rank 是文档在某个检索方式中的排名（从1开始），
     k 是常数（通常取60），防止排名过高主导。
 
     Args:
@@ -27,14 +28,24 @@ def rrf_merge(
         sparse_results: 稀疏检索结果 [{doc_id, content, score, ...}]
         rrf_k: RRF 常数，默认 60
         top_n: 返回 Top-N 条，默认 None（全部返回）
+        weights: (稠密权重, 稀疏权重)，默认 None 即等权 (1.0, 1.0)
 
-    Returns:
-        按 RRF 分数降序排列的去重结果
+    weights 为什么需要
+    ------------------
+    等权 RRF 隐含一个假设：两路检索的质量相当。这个假设经常不成立。
+    实测中稠密向量在口语化 query 上明显强于 BM25，等权融合会把 BM25 的
+    噪声一起拉进来，结果两路都不如纯向量。给弱的一路降权是必要的，
+    但也不能降到 0 —— BM25 在药名、指标这类精确匹配上有不可替代性。
+
+    注意：权重必须在**独立验证集**上确定。在同一批 query 上扫出最优权重
+    再报告该权重的分数，是过拟合，分数不可信。
     """
+    w_dense, w_sparse = weights if weights is not None else (1.0, 1.0)
+
     # 用 dict 聚合：key=doc_id -> {doc_data, rrf_score}
     merged: Dict[str, Any] = {}
 
-    def add_results(results: List[Dict[str, Any]], source: str):
+    def add_results(results: List[Dict[str, Any]], source: str, weight: float):
         for rank, doc in enumerate(results):
             doc_id = str(doc.get("doc_id", doc.get("pk", f"{source}_{rank}")))
             if doc_id not in merged:
@@ -46,11 +57,11 @@ def rrf_merge(
                     **{k: v for k, v in doc.items() if k not in ("doc_id", "content", "score")},
                 }
                 merged[doc_id]["_rrf_score"] = 0.0
-            # 累加 RRF 分数
-            merged[doc_id]["_rrf_score"] += 1.0 / (rrf_k + rank + 1)
+            # 累加带权的 RRF 分数
+            merged[doc_id]["_rrf_score"] += weight / (rrf_k + rank + 1)
 
-    add_results(dense_results, "dense")
-    add_results(sparse_results, "sparse")
+    add_results(dense_results, "dense", w_dense)
+    add_results(sparse_results, "sparse", w_sparse)
 
     # 按 RRF 分数降序排列
     sorted_results = sorted(
