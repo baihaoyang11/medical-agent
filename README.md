@@ -70,7 +70,14 @@ medical-agent/
 │   └── rrf.py               #   RRF 融合
 ├── vectors1.py              # 离线入库（批量 embedding + 断点可重跑）
 ├── preprocess.py            # PDF 结构化预处理
-├── tests/                   # 51 个用例，不需要任何 API Key
+├── tests/                   # 75 个用例，不需要任何 API Key
+├── eval/                    # 离线检索评测
+│   ├── knowledge.py         #   48 个知识点 + 120 条 query + 易混干扰
+│   ├── filler.py            #   无关干扰语料
+│   ├── retrievers.py        #   四种检索配置（复用 core/ 的融合与重排）
+│   ├── metrics.py           #   recall@k / MRR / nDCG
+│   ├── run_eval.py          #   入口：跑对比 + 权重扫描 + 出报告
+│   └── FINDINGS.md          #   结论与解读（不只是数字）
 ├── Dockerfile / docker-compose.yml
 └── .env.example
 ```
@@ -241,10 +248,12 @@ curl -X POST http://localhost:8103/api/chat \
 
 ---
 
-## 6. 测试
+## 6. 测试与评测
+
+### 6.1 单元测试
 
 ```bash
-pytest tests/ -q      # 51 passed，不需要任何 API Key
+pytest tests/ -q      # 75 passed，不需要任何 API Key
 ```
 
 | 文件 | 覆盖内容 |
@@ -254,10 +263,43 @@ pytest tests/ -q      # 51 passed，不需要任何 API Key
 | `test_retry.py` | 退避递增、`max_delay` 上限、不可重试异常不重试 |
 | `test_citations.py` | 去重、截断、prompt 渲染、空输入 |
 | `test_rerank.py` | 排序稳定性、脏输入、主路失败走备路 |
+| `test_eval.py` | 指标算法、BM25 排序、语料/金标完整性（评测脚本自己也要被测） |
 | `test_agent_graph.py` | 真实跑 LangGraph 图：急症短路 / 一次通过 / 改写重试 / 重试上限 / 去重 / 预算丢弃 |
 
 集成测试用 `FakeSkill` + `FakeAnswer` 替掉外部依赖，所以能进 CI——
 **"需要真 Key 才能测"等于"从来没人测"**。
+
+### 6.2 检索评测
+
+单测只能证明代码没坏，证明不了"检索变准了"。`eval/` 下有一套离线评测：
+
+```bash
+python tasks.py eval        # 真实语义向量（bge-small-zh），约 30s
+python tasks.py eval-fast   # 零依赖确定性向量，CI 用，约 1s
+```
+
+**规模**：136 个 chunk（48 核心知识点 + 20 易混干扰 + 68 无关干扰）× 120 条 query
+（书面 / 术语 / 口语三种问法 + 4 条急症）。
+
+**对比四种配置**：纯向量、纯 BM25、混合 RRF、混合 + 重排，外加一个 oracle 上限参考。
+其中混合与重排**直接调用生产的 `core/rrf.py` 和 `core/rerank.py`**，不是另写一份。
+
+**结论（详见 `eval/FINDINGS.md`）**：
+
+| 配置 | R@5 | 术语型 | 口语型 |
+|---|---|---|---|
+| `dense` | **0.974** | 0.900 | **1.000** |
+| `hybrid` | 0.905 | **1.000** | 0.771 |
+| `hybrid+rerank` | 0.914 | **1.000** | 0.812 |
+| `sparse` | 0.767 | **1.000** | 0.479 |
+
+纯向量总体最强，**混合检索低 6.9 个点**——但这个结论只在总体层面成立。
+拆开看：术语型（药名、指标）上 BM25 是 1.000，口语型上只有 0.479；
+药物类问题混合检索 1.000 反超纯向量的 0.920，定义类问题则相反（0.706 vs 1.000）。
+
+**所以真正的结论是：不存在通用最优的检索器，只存在对某类问题最优的检索器。**
+这给 `core/routing.py` 指了一个具体方向——它现在分配的是 `qa_k`/`pdf_k`，
+更该决定的是**用哪种检索器**。
 
 ---
 
@@ -273,8 +315,11 @@ pytest tests/ -q      # 51 passed，不需要任何 API Key
    （新文档必须重启进程才进索引）。正解是换 Milvus 的 sparse 倒排或 Elasticsearch。
 4. **无多轮上下文**：State 支持 `thread_id` 复用，但没有做"指代消解"
    （"它有什么副作用"里的"它"指什么）。
-5. **无自动评测集**：只有单测和人工抽查，没有 recall@k / 答案忠实度的
-   离线评测。要做的话先攒 100 条 query-answer 对当金标。
+5. **检索有评测，答案质量没有**。`eval/` 覆盖了 recall@k / MRR / nDCG 的离线对比
+   （136 chunk × 120 query，结论见 `eval/FINDINGS.md`），但缺**答案忠实度**评测——
+   检索对了不等于答案对，那需要另一套"query → 答案必须命中的要点"金标。
+   而且评测语料是合成的、query 与正文同源，会系统性高估所有方法，
+   这组数字只能用来看**相对差异**，不能当业务指标。
 6. **`test.py` 是手工验收脚本**，不是自动化测试，跑起来要真 Key、要服务在跑。
 7. **仓库不含教材数据**。`pdf_output/`、`pdf_documents/` 都在 `.gitignore` 里。
    教材受著作权保护，逐页抽取的正文等价于全文复制，只能留在本地或内网；
