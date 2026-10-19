@@ -1,5 +1,5 @@
 """
-医学RAG系统 - 综合测试脚本
+医学RAG问答系统 - 综合测试脚本
 测试内容：
 1. 向量数据库连接测试
 2. 检索功能测试
@@ -351,7 +351,7 @@ class RAGSystemTester:
     def run_all_tests(self):
         """运行所有测试"""
         print("\n" + "🔬 "*20)
-        print("🎓 医学RAG系统 - 综合测试")
+        print("🎓 医学RAG问答系统 - 综合测试")
         print("🔬 "*20)
 
         self.test_1_database_connection()
