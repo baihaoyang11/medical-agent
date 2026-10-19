@@ -54,3 +54,6 @@ python vectors1.py                      # 建库（需要 ZHIPU_API_KEY）
 2. **PDF 那一路的数据不在这里**。它在 `pdf_output/pdf_detailed_text.xlsx`，
    由 `preprocess.py` 从 `pdf_documents/*.pdf` 抽取生成。两条链路的语料要分开维护，
    因为它们的更新频率和审核流程完全不同。
+   **`pdf_output/` 已在 `.gitignore` 中，因为它装的是教材正文的逐页抽取结果。
+   教材受著作权保护，抽取产物等同于全文复制，只能留在本地或内网，
+   不要提交、不要随仓库分发。** 开源仓库里只应有抽取脚本，不应有抽取结果。
