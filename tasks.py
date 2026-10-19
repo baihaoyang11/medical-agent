@@ -157,6 +157,18 @@ def clean() -> None:
     print(c("[OK] 已清理缓存", GREEN))
 
 
+def eval_bge() -> None:
+    """检索评测（真实语义向量，需下载约 95MB 模型）"""
+    step("检索评测：bge-small-zh")
+    run([PY, "-m", "eval.run_eval", "--embedder", "bge"])
+
+
+def eval_fast() -> None:
+    """检索评测（零依赖确定性向量，CI 用）"""
+    step("检索评测：hashing（零依赖）")
+    run([PY, "-m", "eval.run_eval", "--embedder", "hashing"])
+
+
 TARGETS = {
     "setup": setup,
     "setup-test": setup_test,
@@ -169,6 +181,8 @@ TARGETS = {
     "dev": dev,
     "docker": docker,
     "clean": clean,
+    "eval": eval_bge,
+    "eval-fast": eval_fast,
 }
 
 
@@ -187,6 +201,7 @@ def main() -> None:
             print(f"  {name:<13}{doc[0] if doc else ''}")
         print()
         print("  verify       配置自检 + 语法检查 + 单测（无需 Key）")
+        print("  eval         检索评测：跑对比实验并生成 eval/report.md")
         return
 
     target = sys.argv[1]

@@ -58,6 +58,49 @@ jobs:
               print("  -", p)
           PY
 
+  eval-reproducible:
+    name: 检索评测可复现
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 评测刻意只依赖 numpy：不装 torch、不下载模型、不要 API Key。
+      # 想验证"评测链路没坏"，用 hashing embedder 就够了；
+      # 真实语义向量（bge）留给本地和发布前跑。
+      - name: 安装最小依赖
+        run: pip install numpy
+
+      - name: 跑评测（零依赖向量）
+        run: python -m eval.run_eval --embedder hashing --no-oracle
+
+      # 断言的不只是"跑完了"，而是"结果是合理的"。
+      # 只断言退出码为 0 的话，指标算错也能通过。
+      - name: 断言结果有效
+        run: |
+          python - <<'PY'
+          import json
+          d = json.load(open("eval/results.json", encoding="utf-8"))
+          m, r = d["meta"], d["results"]
+          assert m["n_queries"] >= 100, f"query 数量异常: {m['n_queries']}"
+          assert m["n_docs"] >= 100, f"语料过小: {m['n_docs']}"
+          assert {"dense", "sparse", "hybrid", "hybrid+rerank"} <= set(r), "配置缺失"
+          for name, res in r.items():
+              v = res["overall"]["recall@5"]
+              assert 0.0 <= v <= 1.0, f"{name} recall@5 越界: {v}"
+          print("评测结果有效：", {k: round(v["overall"]["recall@5"], 3) for k, v in r.items()})
+          PY
+
+      - name: 上传评测报告
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: |
+            eval/report.md
+            eval/results.json
+
   full-install:
     name: 运行依赖可安装（依赖漂移预警）
     runs-on: ubuntu-latest
