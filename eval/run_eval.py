@@ -5,8 +5,12 @@
     python -m eval.run_eval --embedder hashing    # 零依赖兜底，CI 用
 
 输出：
-    eval/report.md     人类可读的对比报告
-    eval/results.json  机器可读的原始结果
+    eval/report.md            人类可读的对比报告（bge）
+    eval/results.json         机器可读的原始结果（bge）
+    eval/report-hashing.md    hashing 的产物，**不覆盖上面的文件**（CI 用）
+
+hashing 是零依赖的确定性向量，只用来验证"评测管线能跑通、指标算得对"，
+它不是效果结论 —— 它的分数和 bge 差得很远，两者混在一起就没法解释。
 
 设计上刻意做的两件事：
 1. **复用生产代码**：RRF 用 core.rrf.rrf_merge，重排用 core.rerank.KeywordReranker。
@@ -236,7 +240,20 @@ def main() -> None:
     ap.add_argument("--depth", type=int, default=10)
     ap.add_argument("--no-oracle", action="store_true", help="跳过上限参考")
     ap.add_argument("--no-sweep", action="store_true", help="跳过融合权重扫描")
+    ap.add_argument(
+        "--out",
+        default="",
+        help="输出文件主名（默认 bge 写 report，其它 embedder 写 report-<name>）",
+    )
     args = ap.parse_args()
+
+    # 不同 embedder 的产物**必须分开写**。
+    # 之前 CI 跑 --embedder hashing 会直接覆盖 eval/results.json，
+    # 导致仓库里提交的报告是 hashing 的分数、而 FINDINGS.md 引用的是 bge 的分数 ——
+    # 结论和报告对不上，这比数字本身差了 6 个点更严重（那是不可复现）。
+    stem = args.out or ("report" if args.embedder == "bge" else f"report-{args.embedder}")
+    report_path = OUT_DIR / f"{stem}.md"
+    data_path = OUT_DIR / f"{stem.replace('report', 'results', 1)}.json"
 
     t0 = time.time()
     corpus = build_corpus()
@@ -253,12 +270,17 @@ def main() -> None:
     sparse = SparseRetriever(corpus)
     hybrid = HybridRetriever(corpus, dense, sparse)
     hybrid_rr = RerankRetriever(corpus, hybrid, reranker=build_reranker("keyword"))
+    # dense + 重排：线上的重排默认是开的（RERANK_STRATEGY=keyword），
+    # 所以"要不要把默认检索器改成 dense"这个问题，必须看 dense 加重排之后是多少，
+    # 而不是只看 dense 单独的成绩。缺这一格，结论就缺一半。
+    dense_rr = RerankRetriever(corpus, dense, reranker=build_reranker("keyword"))
 
     retrievers = {
         "dense": dense,
         "sparse": sparse,
         "hybrid": hybrid,
         "hybrid+rerank": hybrid_rr,
+        "dense+rerank": dense_rr,
     }
     if not args.no_oracle:
         retrievers["oracle(上限)"] = OracleRerankRetriever(corpus, hybrid, gold_lookup(queries))
@@ -296,14 +318,14 @@ def main() -> None:
         "elapsed": time.time() - t0,
     }
 
-    (OUT_DIR / "results.json").write_text(
+    data_path.write_text(
         json.dumps({"meta": meta, "results": results, "sweep": sweep}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     report = render_report(results, meta, sweep)
-    (OUT_DIR / "report.md").write_text(report, encoding="utf-8")
+    report_path.write_text(report, encoding="utf-8")
 
-    print(f"\n[完成] {meta['elapsed']:.1f}s -> eval/report.md  eval/results.json\n")
+    print(f"\n[完成] {meta['elapsed']:.1f}s -> eval/{report_path.name}  eval/{data_path.name}\n")
     print(report)
 
 
