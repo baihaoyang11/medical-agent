@@ -70,13 +70,14 @@ medical-agent/
 │   └── rrf.py               #   RRF 融合
 ├── vectors1.py              # 离线入库（批量 embedding + 断点可重跑）
 ├── preprocess.py            # PDF 结构化预处理
-├── tests/                   # 75 个用例，不需要任何 API Key
+├── tests/                   # 97 个用例，不需要任何 API Key
 ├── eval/                    # 离线检索评测
 │   ├── knowledge.py         #   48 个知识点 + 120 条 query + 易混干扰
 │   ├── filler.py            #   无关干扰语料
-│   ├── retrievers.py        #   四种检索配置（复用 core/ 的融合与重排）
+│   ├── retrievers.py        #   五种检索配置（复用 core/ 的融合与重排）
 │   ├── metrics.py           #   recall@k / MRR / nDCG
 │   ├── run_eval.py          #   入口：跑对比 + 权重扫描 + 出报告
+│   ├── route_audit.py       #   审计路由器：兜底率 + 端到端影响
 │   └── FINDINGS.md          #   结论与解读（不只是数字）
 ├── Dockerfile / docker-compose.yml
 └── .env.example
@@ -88,7 +89,7 @@ medical-agent/
 
 ```bash
 # 0. 先自检：不需要任何 API Key，验证代码与测试是好的
-python tasks.py verify        # 配置自检 + 语法检查 + 51 个单测
+python tasks.py verify        # 配置自检 + 语法检查 + 97 个单测
 
 # 1. 装依赖、配 Key
 pip install -r requirements.txt
@@ -113,6 +114,8 @@ python tasks.py dev           # http://localhost:8103/docs
 | `python tasks.py verify` | 配置自检 + 语法检查 + 单测 | 否 |
 | `python tasks.py data` | 检查数据就绪情况 | 否 |
 | `python tasks.py demo-data` | 生成演示语料 | 否 |
+| `python tasks.py eval` | 检索评测（bge，约 30s） | 否 |
+| `python tasks.py audit` | 路由审计（读评测结果，秒级） | 否 |
 | `python tasks.py dev` | 启动服务 | 是 |
 
 容器方式：
@@ -289,17 +292,43 @@ python tasks.py eval-fast   # 零依赖确定性向量，CI 用，约 1s
 | 配置 | R@5 | 术语型 | 口语型 |
 |---|---|---|---|
 | `dense` | **0.974** | 0.900 | **1.000** |
+| `dense+rerank` | **0.974** | 0.900 | **1.000** |
 | `hybrid` | 0.905 | **1.000** | 0.771 |
 | `hybrid+rerank` | 0.914 | **1.000** | 0.812 |
 | `sparse` | 0.767 | **1.000** | 0.479 |
 
 纯向量总体最强，**混合检索低 6.9 个点**——但这个结论只在总体层面成立。
 拆开看：术语型（药名、指标）上 BM25 是 1.000，口语型上只有 0.479；
-药物类问题混合检索 1.000 反超纯向量的 0.920，定义类问题则相反（0.706 vs 1.000）。
+药物类问题混合检索 1.000 反超纯向量的 0.920，其余四类都是纯向量更好。
 
 **所以真正的结论是：不存在通用最优的检索器，只存在对某类问题最优的检索器。**
-这给 `core/routing.py` 指了一个具体方向——它现在分配的是 `qa_k`/`pdf_k`，
-更该决定的是**用哪种检索器**。
+
+### 6.3 路由审计：为什么这个结论最后没有搬进生产
+
+上面这句话看起来可以直接落地——按问题类型切换检索器。我做了一版，然后用
+`eval/route_audit.py` 审计，**结果把方案否掉了**：
+
+```bash
+python tasks.py audit
+```
+
+| 指标 | 值 |
+|---|---|
+| 分类器兜底率（落进 `general`） | **57.8%**（67/116） |
+| 完美分类下的上界（含重排） | 0.983 |
+| 真实分类器下的结果（含重排） | **0.931** |
+| 统一 `dense+rerank` | **0.974** |
+
+理想和现实差 0.052，**90% 的收益被分类错误吃掉**；而真实路由 0.931
+**打不过**改一行配置的 0.974。
+
+所以 `RETRIEVER_ROUTING` 保持默认关闭，代码保留（架构就位、证据不足），
+理由写在 `core/routing.py` 的 `RETRIEVERS` 表里：每条映射都带 `evidence` 等级
+（`measured` / `hypothesis` / `default`），偏离默认值必须写明依据。
+
+> 这段的价值不在"实现了一个功能"，而在**证明了一个功能不该上线**。
+> 如果一个方案连自己的简化版都打不过，它就不该存在——这个判断只能靠测中间环节得到，
+> 只看最终 R@5 永远发现不了。
 
 ---
 
