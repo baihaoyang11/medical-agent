@@ -26,6 +26,7 @@ class AgentState(TypedDict, total=False):
     # 路由
     question_type: str
     retrieval_strategy: str
+    retriever_mode: str
     emergency: bool
     route_matched: List[str]
 

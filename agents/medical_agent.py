@@ -68,16 +68,26 @@ class MedicalAgent:
         max_retries: int = MAX_RETRIES,
         checkpointer: Any | None = None,
         reranker: Reranker | None = None,
+        retriever_routing: bool | None = None,
+        retriever_default: str | None = None,
     ) -> None:
         self.hybrid_search = hybrid_search_skill
         self.parent_doc = parent_doc_skill
         self.answer_gen = answer_gen_skill
         self.max_retries = max_retries
         self._checkpointer = checkpointer or MemorySaver()
+
+        from config import config as _cfg
+
+        # 检索器路由默认跟随配置（config.RETRIEVER_ROUTING，默认关闭）。
+        # 显式传参优先，测试里可以直接开关而不改环境变量。
+        if retriever_routing is None:
+            retriever_routing = bool(_cfg.RETRIEVER_ROUTING)
+        self._retriever_routing = retriever_routing
+        # 全局默认检索器：路由关闭时所有请求用它，路由打开时只用作兜底
+        self._retriever_default = retriever_default or getattr(_cfg, "RETRIEVER_DEFAULT", "hybrid")
         # 不传就用默认策略（config 里可改），传对象则完全接管
         if reranker is None:
-            from config import config as _cfg
-
             reranker = build_reranker(
                 _cfg.RERANK_STRATEGY,
                 model_path=_cfg.RERANK_MODEL_PATH,
@@ -91,14 +101,19 @@ class MedicalAgent:
     # ================================================================
     def _router_node(self, state: AgentState) -> Dict[str, Any]:
         query = state.get("query", "")
-        decision = resolve(query)
+        decision = resolve(
+            query,
+            retriever_routing=self._retriever_routing,
+            default_retriever=self._retriever_default,
+        )
 
         if decision.emergency:
             step = f"[Router] 命中急症关键词 {list(decision.matched)} → 走安全通道"
         else:
             step = (
                 f"[Router] 类型={decision.question_type} 策略={decision.strategy} "
-                f"(qa_k={decision.params.qa_k}, pdf_k={decision.params.pdf_k})"
+                f"(qa_k={decision.params.qa_k}, pdf_k={decision.params.pdf_k}, "
+                f"检索器={decision.retriever})"
             )
 
         log("route", **decision.to_trace())
@@ -106,6 +121,7 @@ class MedicalAgent:
         return {
             "question_type": decision.question_type,
             "retrieval_strategy": decision.strategy,
+            "retriever_mode": decision.retriever,
             "emergency": decision.emergency,
             "route_matched": list(decision.matched),
             "effective_query": rewrite(query, 1),
@@ -131,34 +147,43 @@ class MedicalAgent:
     def _retrieve_node(self, state: AgentState) -> Dict[str, Any]:
         query = state.get("effective_query") or state["query"]
         retry_count = state.get("retry_count", 0)
-        params = resolve(state["query"]).params
+        decision = resolve(
+            state["query"],
+            retriever_routing=self._retriever_routing,
+            default_retriever=self._retriever_default,
+        )
+        params = decision.params
+        # 以 router 节点写下的一致决策为准（重试时不重新分类，避免同一请求内两种模式）
+        mode = state.get("retriever_mode") or decision.retriever
         steps: list[str] = []
 
         qa_docs: list[dict[str, Any]] = []
         pdf_docs: list[dict[str, Any]] = []
 
         if params.use_qa:
-            with span("skill.hybrid_search", k=params.qa_k, attempt=retry_count + 1):
+            with span("skill.hybrid_search", k=params.qa_k, mode=mode, attempt=retry_count + 1):
                 result = call_with_retry(
                     self.hybrid_search.execute,
                     query=query,
                     k=params.qa_k,
+                    mode=mode,
                     op_name="hybrid_search",
                 )
             if result.get("success"):
                 qa_docs = list(result.get("data") or [])
                 method = (result.get("metadata") or {}).get("method")
-                steps.append(f"[Retrieve] HybridSearch 命中 {len(qa_docs)} 条（{method}）")
+                steps.append(f"[Retrieve] HybridSearch 命中 {len(qa_docs)} 条（{method}，mode={mode}）")
             else:
                 # 检索失败降级为"没有 QA 上下文"，不让整条链路 500
                 steps.append(f"[Retrieve] HybridSearch 失败已降级：{result.get('error')}")
 
         if params.use_pdf:
-            with span("skill.parent_doc_search", k=params.pdf_k, attempt=retry_count + 1):
+            with span("skill.parent_doc_search", k=params.pdf_k, mode=mode, attempt=retry_count + 1):
                 result = call_with_retry(
                     self.parent_doc.execute,
                     query=query,
                     k=params.pdf_k,
+                    mode=mode,
                     op_name="parent_doc_search",
                 )
             if result.get("success"):

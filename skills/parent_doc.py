@@ -1,18 +1,23 @@
 """
 PDF教材检索 Skill — 混合检索 + 父子文档重建
 """
+from __future__ import annotations
+
 import threading
 
 import jieba
 import numpy as np
-from typing import Any, Dict, List, Optional
-from pymilvus import MilvusClient
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from rank_bm25 import BM25Okapi
 from core.base_skill import BaseSkill, SkillResult
 from core.errors import UpstreamError
 from core.observability import span
 from core.retry import call_with_retry
 from core.rrf import rrf_merge
+
+# 同 hybrid_search.py：pymilvus 只用于类型注解，不放进运行时 import 路径
+if TYPE_CHECKING:
+    from pymilvus import MilvusClient
 
 jieba.setLogLevel(20)
 
@@ -182,12 +187,20 @@ class ParentDocSearchSkill(BaseSkill):
 
     # ────────── 主入口 ──────────
 
-    def execute(self, query: str = "", k: int = 3, **kwargs) -> Dict[str, Any]:
+    def execute(self, query: str = "", k: int = 3, mode: str = "hybrid", **kwargs) -> Dict[str, Any]:
+        """mode 与 HybridSearchSkill 一致：dense / sparse / hybrid。
+
+        对 PDF 教材这一路，mode 的收益不如 QA 库明显 —— 教材段落长、
+        术语密度高，BM25 和向量的差异本来就比 QA 对更小。这里支持 mode
+        主要是为了让路由层的决策在两条路上语义一致。
+        """
         if not query:
             return SkillResult.fail("query 不能为空")
+        if mode not in ("dense", "sparse", "hybrid"):
+            mode = "hybrid"
         try:
-            dense = self._dense_search(query, k)
-            bm25 = self._bm25_search(query, k)
+            dense = self._dense_search(query, k) if mode in ("dense", "hybrid") else []
+            bm25 = self._bm25_search(query, k) if mode in ("sparse", "hybrid") else []
 
             if dense and bm25:
                 merged = rrf_merge(dense, bm25, top_n=k * 2)
@@ -199,7 +212,8 @@ class ParentDocSearchSkill(BaseSkill):
                 merged = bm25[:k * 2]
                 method = "bm25_only+parent_doc"
             else:
-                return SkillResult.ok(data=[], count=0, method="no_results", query=query)
+                return SkillResult.ok(data=[], count=0, method="no_results",
+                                      requested=mode, query=query)
 
             # 重建父文档
             parent_docs = self._reconstruct_parent_docs(merged, top_k=k)
@@ -211,7 +225,7 @@ class ParentDocSearchSkill(BaseSkill):
                     "source": d.get("source", ""),
                     "page": d.get("page", 0),
                 } for d in parent_docs],
-                count=len(parent_docs), method=method, query=query,
+                count=len(parent_docs), method=method, requested=mode, query=query,
                 dense_count=len(dense), bm25_count=len(bm25))
         except Exception as e:
             return SkillResult.fail(f"PDF教材检索失败: {e}", query=query, error_type=type(e).__name__)

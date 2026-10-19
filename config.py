@@ -48,6 +48,22 @@ class Config:
     RERANK_MODEL_PATH: str = os.getenv("RERANK_MODEL_PATH", "")
     RERANK_WEIGHT: float = float(os.getenv("RERANK_WEIGHT", "0.6"))
 
+    # ===== 检索器路由 =====
+    # 全局默认检索器：dense / sparse / hybrid。
+    # 评测（单库、116 条 query）显示 dense R@5 0.974 > hybrid 0.905，
+    # 但生产是 QA + PDF 双库，教材段落长、术语密度高，结论不能直接外推。
+    # 想试纯向量可以改这一行，不用改代码：RETRIEVER_DEFAULT=dense
+    RETRIEVER_DEFAULT: str = os.getenv("RETRIEVER_DEFAULT", "hybrid")
+
+    # 关闭（默认）时一律走 RETRIEVER_DEFAULT，与改造前一致。
+    # 打开后才按 core/routing.py 的 RETRIEVERS 表为不同类型选择 dense / sparse / hybrid。
+    # 默认关闭的原因：评测集上支撑该映射的样本只有 17 条，McNemar p=0.0625，
+    # 未达显著；而且现有分类器有 57.8% 的请求落进 general 兜底（见 eval/route_audit.md），
+    # 真实路由 R@5 0.922 还不如统一 dense 的 0.974。证据不足时改默认路径，
+    # 等于用线上流量验证一个未验证的假设。
+    RETRIEVER_ROUTING: bool = os.getenv("RETRIEVER_ROUTING", "false").lower() == "true"
+    RETRIEVER_MODES = ("dense", "sparse", "hybrid")
+
     # ===== 离线入库（vectors1.py）=====
     EMBED_BATCH_SIZE: int = int(os.getenv("EMBED_BATCH_SIZE", "32"))
 
@@ -136,6 +152,12 @@ class Config:
             problems.append(
                 f"EMBED_BATCH_SIZE={cls.EMBED_BATCH_SIZE} 不合理，应为 1~64"
                 "（智谱 embedding-3 单次上限 64 条）"
+            )
+
+        if cls.RETRIEVER_DEFAULT not in cls.RETRIEVER_MODES:
+            problems.append(
+                f"RETRIEVER_DEFAULT={cls.RETRIEVER_DEFAULT!r} 不是合法值，"
+                f"可选：{', '.join(cls.RETRIEVER_MODES)}"
             )
 
         return problems

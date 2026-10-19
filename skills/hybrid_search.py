@@ -1,12 +1,13 @@
 """
 混合检索 Skill — 稠密向量语义检索 + BM25关键词检索 + RRF融合排序
 """
+from __future__ import annotations
+
 import threading
 
 import jieba
 import numpy as np
-from typing import Any, Dict, List, Optional
-from pymilvus import MilvusClient
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from rank_bm25 import BM25Okapi
 from core.base_skill import BaseSkill, SkillResult
 from core.errors import UpstreamError
@@ -14,7 +15,16 @@ from core.observability import span
 from core.retry import call_with_retry
 from core.rrf import rrf_merge
 
+# pymilvus 只用在类型注解上，运行时不需要这个符号。
+# 放到 TYPE_CHECKING 里，重型依赖就不在 import 路径上了 ——
+# 单测可以只装最小依赖集跑真实代码，而不是被一个用不到的类型拖住。
+if TYPE_CHECKING:
+    from pymilvus import MilvusClient
+
 jieba.setLogLevel(20)
+
+# 与 core/routing.py 的 RetrieverMode 保持一致
+_VALID_MODES = ("dense", "sparse", "hybrid")
 
 
 class HybridSearchSkill(BaseSkill):
@@ -135,28 +145,41 @@ class HybridSearchSkill(BaseSkill):
 
     # ────────── 主入口 ──────────
 
-    def execute(self, query: str = "", k: int = 10, **kwargs) -> Dict[str, Any]:
+    def execute(self, query: str = "", k: int = 10, mode: str = "hybrid", **kwargs) -> Dict[str, Any]:
+        """mode 决定走哪一路：
+
+        dense  只跑向量（语义强、术语弱）
+        sparse 只跑 BM25（术语强、口语弱）
+        hybrid 两路都跑再 RRF 融合（默认）
+
+        mode 由路由层给（见 core/routing.py 的 RETRIEVERS），不是调用方随手传的。
+        非法值回退 hybrid 而不是报错 —— 检索配置写错不该让整个请求 500。
+        """
         if not query:
             return SkillResult.fail("query 不能为空")
+        if mode not in _VALID_MODES:
+            mode = "hybrid"
         try:
-            dense = self._dense_search(query, k)
-            bm25 = self._bm25_search(query, k)
+            dense = self._dense_search(query, k) if mode in ("dense", "hybrid") else []
+            bm25 = self._bm25_search(query, k) if mode in ("sparse", "hybrid") else []
 
             if dense and bm25:
                 final = rrf_merge(dense, bm25, top_n=k)
                 method = "hybrid_dense+bm25+rrf"
             elif dense:
                 final = dense[:k]
+                # requested 与 method 并列，才能区分"配置就要 dense"和"融合降级成 dense"
                 method = "dense_only"
             elif bm25:
                 final = bm25[:k]
                 method = "bm25_only"
             else:
-                return SkillResult.ok(data=[], count=0, method="no_results", query=query)
+                return SkillResult.ok(data=[], count=0, method="no_results",
+                                      requested=mode, query=query)
 
             return SkillResult.ok(
                 data=[{"content": r["content"], "score": r.get("score", 0), "doc_id": r.get("doc_id", "")} for r in final],
-                count=len(final), method=method, query=query,
+                count=len(final), method=method, requested=mode, query=query,
                 dense_count=len(dense), bm25_count=len(bm25))
         except Exception as e:
             # 关键：把异常向上抛，让 Agent 层决定降级；不要再 print 吞掉
