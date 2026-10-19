@@ -187,6 +187,17 @@ def eval_dual_fast() -> None:
     run([PY, "-m", "eval.run_dual_eval", "--embedder", "hashing", "--fast"])
 
 
+def rebuild() -> None:
+    """七步从零重建（教学用，看每一层改变了什么）"""
+    steps = [
+        "step1_literal", "step2_vector", "step3_hybrid", "step4_rerank",
+        "step5_route", "step6_quality", "step7_summary",
+    ]
+    for i, name in enumerate(steps, 1):
+        step(f"重建 {i}/7：{name}")
+        run([PY, "-m", f"rebuild.{name}"])
+
+
 TARGETS = {
     "setup": setup,
     "setup-test": setup_test,
@@ -204,6 +215,7 @@ TARGETS = {
     "audit": audit,
     "dual": eval_dual,
     "dual-fast": eval_dual_fast,
+    "rebuild": rebuild,
 }
 
 
@@ -225,6 +237,7 @@ def main() -> None:
         print("  eval         检索评测：跑对比实验并生成 eval/report.md")
         print("  audit        路由审计：关键词路由器的兜底率与端到端影响")
         print("  dual         双库评测：qa_k / pdf_k / 上下文预算的依据")
+        print("  rebuild      七步从零重建（教学用）")
         return
 
     target = sys.argv[1]
