@@ -78,12 +78,17 @@ jobs:
 
       # 断言的不只是"跑完了"，而是"结果是合理的"。
       # 只断言退出码为 0 的话，指标算错也能通过。
+      #
+      # 读的是 results-hashing.json 而不是 results.json：
+      # hashing 的产物不能覆盖 bge 的报告，否则仓库里提交的结论
+      # 会和 CI 每次跑出来的分数对不上 —— 那是不可复现。
       - name: 断言结果有效
         run: |
           python - <<'PY'
           import json
-          d = json.load(open("eval/results.json", encoding="utf-8"))
+          d = json.load(open("eval/results-hashing.json", encoding="utf-8"))
           m, r = d["meta"], d["results"]
+          assert m["embedder"] == "hashing", f"embedder 不符: {m['embedder']}"
           assert m["n_queries"] >= 100, f"query 数量异常: {m['n_queries']}"
           assert m["n_docs"] >= 100, f"语料过小: {m['n_docs']}"
           assert {"dense", "sparse", "hybrid", "hybrid+rerank"} <= set(r), "配置缺失"
@@ -93,13 +98,32 @@ jobs:
           print("评测结果有效：", {k: round(v["overall"]["recall@5"], 3) for k, v in r.items()})
           PY
 
+      # 路由审计只读评测结果，不重新检索，所以可以和上面共用一次产物。
+      # 断言兜底率有上限：路由器被改坏（比如所有规则都命中不了）时，
+      # 兜底率会飙到 100%，这里能挡住。
+      - name: 路由审计
+        run: python -m eval.route_audit --into results-hashing.json --out route_audit-hashing
+
+      - name: 断言路由审计有效
+        run: |
+          python - <<'PY'
+          import json
+          d = json.load(open("eval/route_audit-hashing.json", encoding="utf-8"))
+          assert d["n_queries"] >= 100, f"query 数量异常: {d['n_queries']}"
+          assert d["fallback_rate"] < 0.95, f"兜底率异常高: {d['fallback_rate']:.1%}"
+          print("路由审计有效：兜底率 "
+                f"{d['fallback_rate']:.1%}，真实路由 R@5 {d['r5_actual_routing']:.3f}")
+          PY
+
       - name: 上传评测报告
         uses: actions/upload-artifact@v4
         with:
           name: eval-report
           path: |
-            eval/report.md
-            eval/results.json
+            eval/report-hashing.md
+            eval/results-hashing.json
+            eval/route_audit-hashing.md
+            eval/route_audit-hashing.json
 
   full-install:
     name: 运行依赖可安装（依赖漂移预警）

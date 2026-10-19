@@ -169,6 +169,12 @@ def eval_fast() -> None:
     run([PY, "-m", "eval.run_eval", "--embedder", "hashing"])
 
 
+def audit() -> None:
+    """路由审计：关键词路由器到底把多少请求分对了"""
+    step("路由审计")
+    run([PY, "-m", "eval.route_audit"])
+
+
 TARGETS = {
     "setup": setup,
     "setup-test": setup_test,
@@ -183,6 +189,7 @@ TARGETS = {
     "clean": clean,
     "eval": eval_bge,
     "eval-fast": eval_fast,
+    "audit": audit,
 }
 
 
@@ -202,6 +209,7 @@ def main() -> None:
         print()
         print("  verify       配置自检 + 语法检查 + 单测（无需 Key）")
         print("  eval         检索评测：跑对比实验并生成 eval/report.md")
+        print("  audit        路由审计：关键词路由器的兜底率与端到端影响")
         return
 
     target = sys.argv[1]
