@@ -9,3 +9,9 @@ langgraph>=0.2
 #             不装也能跑（回退到字符二元组），但那样测的是另一条路径
 numpy>=1.24
 jieba>=0.42
+
+# 检索器路由测试（tests/test_retriever_routing.py）直接 import 生产的
+# skills/hybrid_search.py，验证 mode 分支真的改变了检索路径。
+# 该模块顶层 import rank_bm25，所以这里必须装 —— 否则那几条断言会被 skip，
+# 而 skip 掉的断言等于没写。
+rank_bm25>=0.2
