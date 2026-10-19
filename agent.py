@@ -16,7 +16,7 @@
 
 API 端点：
   POST /          — 基础问答（向后兼容前端）
-  POST /api/chat  — Agent 思考链可视化问答（面试展示用）
+  POST /api/chat  — 带思考链与引用的完整问答
   GET  /api/skills — 查看所有注册的 Skills
   GET  /api/health — 健康检查
 """
@@ -56,6 +56,8 @@ from skills.hybrid_search import HybridSearchSkill
 from skills.parent_doc import ParentDocSearchSkill
 from skills.answer_gen import AnswerGenerationSkill
 from agents.medical_agent import MedicalAgent
+from core.errors import AppError
+from core.observability import bind_trace, current_trace_id, log, new_trace_id
 
 # ================================================================
 # 安全工具
@@ -65,6 +67,21 @@ security = HTTPBearer(auto_error=False)
 
 # 内存限流器：{ip: [(timestamp, requests)]}
 rate_limit_store: dict = defaultdict(list)
+
+# 进程内指标。单 worker 下准确；多 worker 需要接 Prometheus 聚合，
+# 这里的定位是"本地可观测"，不是线上监控系统。
+METRICS: dict = {
+    "requests_total": 0,
+    "errors_total": 0,
+    "timeouts_total": 0,
+    "rate_limited_total": 0,
+    "emergency_total": 0,
+    "degraded_total": 0,
+}
+
+
+def _now() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def check_rate_limit(ip: str) -> bool:
@@ -205,34 +222,70 @@ print("=" * 60)
 
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
-    """全局安全中间件：限流 + 请求耗时监控。"""
+    """全局中间件：trace_id 绑定 + 限流 + 访问日志 + 耗时统计。
+
+    trace_id 优先取上游传入的 X-Trace-Id（便于跨服务串联），否则新建。
+    绑定后，本次请求内所有 log() 都会自动带上同一个 trace_id。
+    """
     # 跳过健康检查等公共端点
-    if request.url.path in ["/api/health", "/docs", "/redoc", "/openapi.json"]:
+    if request.url.path in ["/api/health", "/metrics", "/docs", "/redoc", "/openapi.json"]:
         return await call_next(request)
 
-    # 获取客户端IP
     ip = request.client.host if request.client else "unknown"
 
-    # 限流检查
     if not check_rate_limit(ip):
+        METRICS["rate_limited_total"] += 1
+        log("rate_limited", level="WARNING", ip=ip, path=request.url.path)
         return JSONResponse(
             status_code=429,
             content={
                 "error": "请求过于频繁，请稍后再试",
                 "status": 429,
                 "retry_after": config.RATE_LIMIT_WINDOW,
-                "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "time": _now(),
             },
         )
 
-    # 记录开始时间
-    start_time = time.time()
-    response = await call_next(request)
-    elapsed = time.time() - start_time
+    trace_id = request.headers.get("X-Trace-Id") or new_trace_id()
+    started = time.time()
 
-    # 添加耗时响应头
-    response.headers["X-Response-Time"] = f"{elapsed:.3f}s"
-    return response
+    with bind_trace(trace_id):
+        METRICS["requests_total"] += 1
+        log("request_start", method=request.method, path=request.url.path, ip=ip)
+        try:
+            response = await call_next(request)
+        except Exception as exc:  # noqa: BLE001 - 记录后继续抛给上层处理器
+            METRICS["errors_total"] += 1
+            log(
+                "request_crash",
+                level="ERROR",
+                error=type(exc).__name__,
+                message=str(exc)[:300],
+            )
+            raise
+
+        elapsed = (time.time() - started) * 1000
+        response.headers["X-Response-Time"] = f"{elapsed / 1000:.3f}s"
+        response.headers["X-Trace-Id"] = trace_id
+        log("request_end", status=response.status_code, dur_ms=round(elapsed, 2))
+        return response
+
+
+@app.exception_handler(AppError)
+async def app_error_handler(request: Request, exc: AppError):
+    """业务异常统一出口：带上 code 与 trace_id，前端能定位。"""
+    METRICS["errors_total"] += 1
+    log("app_error", level="ERROR", code=exc.code, message=exc.message, path=request.url.path)
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={
+            "error": exc.message,
+            "code": exc.code,
+            "status": exc.http_status,
+            "trace_id": current_trace_id(),
+            "time": _now(),
+        },
+    )
 
 
 # ================================================================
@@ -309,11 +362,18 @@ async def chatbot(request: Request):
         return {"response": f"处理请求时出错: {str(e)}", "status": 500,
                 "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
-    now = datetime.datetime.now()
+    if result.get("emergency"):
+        METRICS["emergency_total"] += 1
+    if result.get("degraded"):
+        METRICS["degraded_total"] += 1
+
     return {
         "response": result["answer"],
         "status": 200,
-        "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "time": _now(),
+        "citations": result.get("citations", []),
+        "degraded": result.get("degraded", False),
+        "trace_id": current_trace_id(),
     }
 
 
@@ -372,17 +432,27 @@ async def agent_chat(request: ChatRequest, req: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"处理请求时出错: {str(e)}")
 
-    now = datetime.datetime.now()
+    if result.get("emergency"):
+        METRICS["emergency_total"] += 1
+    if result.get("degraded"):
+        METRICS["degraded_total"] += 1
+
     return {
         "answer": result["answer"],
         "thinking_steps": result.get("thinking_steps", []),
         "question_type": result.get("question_type", "general"),
         "retrieval_strategy": result.get("retrieval_strategy", "hybrid"),
         "context_length": result.get("context_length", 0),
+        "citations": result.get("citations", []),
+        "quality": result.get("quality", {}),
+        "retry_count": result.get("retry_count", 0),
+        "emergency": result.get("emergency", False),
+        "degraded": result.get("degraded", False),
         "skills_used": list(medical_agent.get_skill_registry().keys()),
         "elapsed_seconds": round(elapsed, 2),
+        "trace_id": current_trace_id(),
         "status": 200,
-        "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "time": _now(),
     }
 
 
@@ -396,6 +466,25 @@ async def list_skills():
     return {
         "skills": medical_agent.get_skill_registry(),
         "total": len(medical_agent.get_skill_registry()),
+    }
+
+
+@app.get(
+    "/metrics",
+    summary="进程内指标",
+    description="请求量、错误量、降级与急症命中次数（公开端点，供本地排查）",
+)
+async def metrics():
+    """轻量指标端点。
+
+    注意：数据在进程内存里，多 worker 部署时需要换成 Prometheus 客户端，
+    否则看到的是单个 worker 的数字。
+    """
+    return {
+        "metrics": dict(METRICS),
+        "rate_limit_enabled": config.RATE_LIMIT_ENABLED,
+        "auth_enabled": config.AUTH_ENABLED,
+        "server_time": _now(),
     }
 
 
@@ -421,6 +510,18 @@ async def health_check():
 # Step 7: 启动服务
 # ================================================================
 if __name__ == "__main__":
+    # 启动即自检：缺 Key、策略名写错这类问题，留到第一次请求才暴露时
+    # 表现是"服务起来了但一问就 500"，排查成本远高于启动时直接失败。
+    _problems = config.validate()
+    if _problems:
+        print("\n[FATAL] 配置有误，服务未启动：")
+        for _p in _problems:
+            print(f"  - {_p}")
+        print("\n请参考 .env.example 补全配置后重试。\n")
+        sys.exit(1)
+    for _w in config.warnings():
+        print(f"[WARN] {_w}")
+
     print(f"\n🌐 API 文档: http://localhost:{config.PORT}/docs")
     print(f"🔍 Skills 列表: http://localhost:{config.PORT}/api/skills")
     print(f"💬 Agent 问答: POST http://localhost:{config.PORT}/api/chat")
