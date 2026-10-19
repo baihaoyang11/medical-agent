@@ -52,13 +52,21 @@ class ZhipuAIEmbeddings(Embeddings):
     
 # model2:大语言模型部署(deepseek-chat)进行问题生成和答案生成
 def create_deepseek_client():
+    """医疗问答的温度必须低。
+
+    temperature=0.7 适合创作，但医学问答要的是可复现、少发挥，
+    默认 0.2；需要更高稳定性可通过环境变量调到 0。
+    """
+    temperature = float(os.getenv("LLM_TEMPERATURE", "0.2"))
     llm = ChatOpenAI(
-        model = 'deepseek-chat',
+        model = os.getenv("LLM_MODEL", "deepseek-chat"),
         api_key = deepseek_api_key,
-        base_url = 'https://api.deepseek.com/v1',
-        temperature = 0.7
+        base_url = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1"),
+        temperature = temperature,
+        timeout = float(os.getenv("LLM_TIMEOUT", "60")),
+        max_retries = 0,  # 重试由 core.retry 统一控制，避免两层重试叠加放大
     )
-    print("Deepseek-chat模型创建成功")
+    print(f"Deepseek-chat模型创建成功 (temperature={temperature})")
     return llm
 
 def generate_deepseek_answer(question,llm):
@@ -66,7 +74,7 @@ def generate_deepseek_answer(question,llm):
     return answer
 
 if __name__ == '__main__':
-    llm = create_deepseek_model()
+    llm = create_deepseek_client()
     output = generate_deepseek_answer("什么是糖尿病？", llm)
     print("问题：什么是糖尿病？")
     print("答案：", output)
