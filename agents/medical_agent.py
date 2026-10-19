@@ -36,6 +36,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
 from core.citations import build_citations, render_for_prompt
+from core.context import compose_context, dedupe
 from core.observability import log, span
 from core.quality import assess
 from core.rerank import Reranker, build_reranker
@@ -195,7 +196,7 @@ class MedicalAgent:
             else:
                 steps.append(f"[Retrieve] ParentDoc 失败已降级：{result.get('error')}")
 
-        merged = _dedupe(qa_docs + pdf_docs)
+        merged = dedupe(qa_docs + pdf_docs)
 
         # 融合只用了排名信息，尺度不可比；重排把"真正答这个问题"的段落提到前面，
         # 上下文预算按重要性分配才有意义（超预算时丢的是尾部）。
@@ -205,7 +206,7 @@ class MedicalAgent:
             mark = "（已降级）" if getattr(self._reranker, "degraded", False) else ""
             steps.append(f"[Retrieve] {self._reranker.name} 重排 {len(merged)} 条{mark}")
 
-        context = _compose_context(merged, params.max_context_chars)
+        context = compose_context(merged, params.max_context_chars)
 
         steps.append(
             f"[Retrieve] 去重后 {len(merged)} 条，上下文 {len(context)} 字符"
@@ -394,39 +395,3 @@ class MedicalAgent:
             self.parent_doc.name: self.parent_doc.to_tool_definition(),
             self.answer_gen.name: self.answer_gen.to_tool_definition(),
         }
-
-
-# ====================================================================
-# 纯函数：上下文装配与去重（拆出来便于单测）
-# ====================================================================
-
-def _dedupe(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """按 (doc_id, 内容前 60 字) 去重，保留首次出现。
-
-    只用 doc_id 不够：同一父文档的不同段落 doc_id 相同但内容不同。
-    """
-    seen: set[tuple[str, str]] = set()
-    out: list[dict[str, Any]] = []
-    for d in docs:
-        content = str(d.get("content") or d.get("text") or "")
-        key = (str(d.get("doc_id") or ""), content[:60])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(d)
-    return out
-
-
-def _compose_context(docs: list[dict[str, Any]], budget: int) -> str:
-    """按预算拼上下文。超预算时整段丢弃，而不是截断——半句话比没有更危险。"""
-    parts: list[str] = []
-    used = 0
-    for d in docs:
-        content = str(d.get("content") or d.get("text") or "").strip()
-        if not content:
-            continue
-        if used + len(content) > budget and parts:
-            break
-        parts.append(content)
-        used += len(content)
-    return "\n\n---\n\n".join(parts)

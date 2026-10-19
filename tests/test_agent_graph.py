@@ -20,7 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 pytest.importorskip("langgraph")
 
-from agents.medical_agent import MedicalAgent, _compose_context, _dedupe  # noqa: E402
+from agents.medical_agent import MedicalAgent  # noqa: E402
+from core.context import compose_context, dedupe  # noqa: E402
 
 LONG_DOC = (
     "糖尿病患者的饮食禁忌包括：控制碳水化合物总量，避免精制糖与含糖饮料；"
@@ -125,12 +126,12 @@ def test_dedupe_keeps_distinct_chunks_of_same_doc():
         {"doc_id": "d1", "content": "第一段内容" * 20},
         {"doc_id": "d1", "content": "第二段完全不同的内容" * 10},
     ]
-    assert len(_dedupe(docs)) == 2
+    assert len(dedupe(docs)) == 2
 
 
 def test_compose_context_drops_whole_doc_over_budget():
     docs = [{"content": "甲" * 100}, {"content": "乙" * 100}, {"content": "丙" * 100}]
-    context = _compose_context(docs, budget=250)
+    context = compose_context(docs, budget=250)
 
     assert "甲" in context
     assert "丙" not in context, "超预算的文档应整段丢弃，而不是截断"
