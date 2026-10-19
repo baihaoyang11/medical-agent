@@ -70,7 +70,7 @@ medical-agent/
 │   └── rrf.py               #   RRF 融合
 ├── vectors1.py              # 离线入库（批量 embedding + 断点可重跑）
 ├── preprocess.py            # PDF 结构化预处理
-├── tests/                   # 97 个用例，不需要任何 API Key
+├── tests/                   # 111 个用例，不需要任何 API Key
 ├── eval/                    # 离线检索评测
 │   ├── knowledge.py         #   48 个知识点 + 120 条 query + 易混干扰
 │   ├── filler.py            #   无关干扰语料
@@ -78,6 +78,8 @@ medical-agent/
 │   ├── metrics.py           #   recall@k / MRR / nDCG
 │   ├── run_eval.py          #   入口：跑对比 + 权重扫描 + 出报告
 │   ├── route_audit.py       #   审计路由器：兜底率 + 端到端影响
+│   ├── dual_store.py        #   双库模拟：QA 库（结论句）+ PDF 库（完整段落）
+│   ├── run_dual_eval.py     #   双库入口：扫 qa_k × pdf_k × 预算
 │   └── FINDINGS.md          #   结论与解读（不只是数字）
 ├── Dockerfile / docker-compose.yml
 └── .env.example
@@ -89,7 +91,7 @@ medical-agent/
 
 ```bash
 # 0. 先自检：不需要任何 API Key，验证代码与测试是好的
-python tasks.py verify        # 配置自检 + 语法检查 + 97 个单测
+python tasks.py verify        # 配置自检 + 语法检查 + 111 个单测
 
 # 1. 装依赖、配 Key
 pip install -r requirements.txt
@@ -116,6 +118,7 @@ python tasks.py dev           # http://localhost:8103/docs
 | `python tasks.py demo-data` | 生成演示语料 | 否 |
 | `python tasks.py eval` | 检索评测（bge，约 30s） | 否 |
 | `python tasks.py audit` | 路由审计（读评测结果，秒级） | 否 |
+| `python tasks.py dual` | 双库评测：qa_k / pdf_k 的依据（约 30s） | 否 |
 | `python tasks.py dev` | 启动服务 | 是 |
 
 容器方式：
@@ -332,6 +335,38 @@ python tasks.py audit
 > 这段的价值不在"实现了一个功能"，而在**证明了一个功能不该上线**。
 > 如果一个方案连自己的简化版都打不过，它就不该存在——这个判断只能靠测中间环节得到，
 > 只看最终 R@5 永远发现不了。
+
+### 6.4 双库评测：qa_k / pdf_k 那些数字是怎么来的
+
+`core/routing.py` 的 `STRATEGIES` 表给每种问题类型分配了不同的 `qa_k / pdf_k`，
+比如药物类 `qa_k=15 / pdf_k=1`、定义类 `qa_k=4 / pdf_k=4`。
+
+**这些数字原来是拍脑袋定的**，而注释里写着"数值依据见 `docs/retrieval-tuning.md`"——
+那个文件从来没存在过。等于假装有依据，这是比数字不准更糟的问题。
+
+所以补了 `eval/run_dual_eval.py`：把知识点用两种粒度组织成一个 QA 库和一个 PDF 库，
+测不同配比下的**要点召回**（金标知识点的句子有几成真的进了上下文）。
+
+```bash
+python tasks.py dual        # bge，约 30s
+python tasks.py dual-fast   # 零依赖，CI 用，约 3s
+```
+
+结果（`eval/dual_report.md`）：
+
+| 做法 | 要点召回 | 说明 |
+|---|---|---|
+| 只给 QA 库，给到 15 条 | **0.321** | 到顶了——QA 库里只有结论句，缺的细节再多给几条也拿不到 |
+| 只给 PDF 库 1 篇 | 0.940 | |
+| 只给 PDF 库 4 篇 | 0.991 | |
+| 预算 2000 → 8000 | 0.977 → 0.987 | 基本饱和，配 6000 的那几档有 4000 字符是白花的 |
+
+**这套结论没有拿去改生产默认值。** 因为模拟里 QA 库的内容是刻意砍成"只有结论句"的
+（不砍就没有区分度，第一版整张网格全是 1.000），真实库里可能有教材没写的内容。
+方向可信、具体数字不可信——要改就得在真实双库上重测。
+
+这个脚本的价值不是给出六个新数字，而是**让这六个数字第一次可以被质疑**：
+改 `CANDIDATES` 就能在自己库上重跑。
 
 ---
 

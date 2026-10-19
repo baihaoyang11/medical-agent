@@ -62,7 +62,20 @@ class RetrievalParams:
         return self.pdf_k > 0
 
 
-# 策略 → 参数。数值依据见 docs/retrieval-tuning.md
+# 策略 → 参数。
+#
+# 这些数字的来历要说清楚，因为它们是**经验值**，不是调优结果：
+# 最初按"药物问题 QA 精度高、定义问题教材更严谨"的直觉定的，没有任何实验支撑。
+# 原来的注释写"依据见 docs/retrieval-tuning.md"，而那个文件从来没存在过 ——
+# 等于假装有依据。
+#
+# 后来补了 `eval/run_dual_eval.py` 去测（结论见 eval/dual_report.md）。
+# 模拟结果和这张表**有出入**：qa_k 从 2 加到 15 几乎不影响要点召回，
+# pdf_k 才是主要信息来源，而 `hybrid_qa_heavy`（15/1）在模拟里是四档里最差的一档。
+#
+# 但**没有据此改下面这些数字**，原因写在 dual_report.md 第 6 节：
+# 模拟里 QA 库的内容被刻意砍成"只有结论句"，真实库不一定这样。
+# 方向可信、具体数值不可信 —— 要改就得在真实双库上重测，不能拿模拟值上线。
 STRATEGIES: dict[str, RetrievalParams] = {
     # 用药与饮食：QA 库里是结构化问答，精度更高，PDF 只取 1 段做机制补充
     "hybrid_qa_heavy": RetrievalParams(qa_k=15, pdf_k=1, max_context_chars=4000),
